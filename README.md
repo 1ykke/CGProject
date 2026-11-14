@@ -1,5 +1,57 @@
 # 基于软件光栅化的交互式太阳系可视化与抗锯齿分析
 
+## 当前开发状态
+
+当前默认项目是固定的太阳、八大行星。使用逐星球面图作为不可变基准；九颗天体都有可调的三维网格起伏和重新计算的法线。地球和火星使用相对高度图，其他天体从各自影像生成固定的艺术化形状图。水星现在可单独调整影像锚定的撞击坑深度；金星用独立的雷达表面与半透明可见云顶网格，可分别调整两层起伏；木星可单独调整云带及大红斑区域的云顶形状。单星设计页还支持在球面上用 Raise、Lower、Smooth 笔刷局部雕刻；金星可选择云顶或雷达表面，笔画可撤销，编辑网格随项目保存。用户可在桌面端逐星进入放大设计视图，调整参数、对照原貌、重置本星，返回总览后运行 REBOUND 引力与碰撞模拟。旧的 `examples/encounter.json` 和 `examples/collision.json` 仍作为独立实验沙盒读取。
+
+当前渲染器由 CPU 对球体和环带三角形进行近裁剪、透视投影、深度测试、底图采样与 1× 单采样、4× SSAA、4× MSAA。轨道线段也会在投影前裁到相机近端。MSAA 保留四个覆盖及深度样本，每个三角形在同一像素内复用一次着色结果；像素显微镜显示最终样本位置、天体与表面类别、深度、线性颜色及合成 RGB。旧实验沙盒仍使用程序化材质。Dear ImGui 桌面窗口负责逐星设计、旋转相机、同场景采样对比和启动同一套 REBOUND 模拟；OpenGL（Linux/Windows）或 Metal（macOS）只上传并显示 CPU 图像。完整渲染性能统计仍是后续阶段。
+
+**当前边界：**九颗天体使用不同球面图并提供对应的参数：太阳颗粒/黑子，水星撞击坑形状与对比，金星双层云顶/雷达表面，地球地形/云/冰，火星地形/沙尘，木星云带与大红斑局部形状，海王星固定风暴区域，土星环及卡西尼缝，天王星轴倾与淡环。九颗天体的整体起伏滑块都会改变网格轮廓；太阳与气态行星的形状仅为影像引导的艺术化光球或云顶，并非固体山脉或物理高程。水星坑深和金星雷达表面起伏同样是影像推断的视觉效果，不是测量高程。科学高程、可演化风暴形态和复杂大气仍待扩展。轨道距离是示意值，不用于精密天文预测。素材来源和授权见 `docs/ASSET_SOURCES.md`。
+
+### 构建与运行
+
+需要 CMake 3.21+、C++17 编译器和网络访问以获取 nlohmann/json 与 REBOUND 5.0.1。也可用 `-DREBOUND_SOURCE_DIR=/path/to/rebound` 指向兼容的 REBOUND 5.0.1 源码目录。
+
+```sh
+cmake -S . -B build-headless -DPLANET_BUILD_DESKTOP=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-headless -j
+ctest --test-dir build-headless --output-on-failure
+./build-headless/planet_sandbox --output solar-system.ppm --state state.json
+./build-headless/planet_sandbox --body earth --output earth.ppm
+./build-headless/planet_sandbox --body mars --output mars.ppm
+./build-headless/planet_sandbox --config examples/encounter.json --time 0 --output frame.ppm
+./build-headless/planet_sandbox --config examples/collision.json --time 0.3 --output collision.ppm --state collision-state.json
+./build-headless/planet_sandbox --config examples/encounter.json --time 0.3 --samples 4 --output ssaa4.ppm
+./build-headless/planet_sandbox --body earth --sampling msaa4 --output earth-msaa4.ppm
+```
+
+PPM 可用系统图片工具转换为 PNG。`--sampling` 接受 `single`、`ssaa4` 或 `msaa4`；兼容选项 `--samples 1|4` 分别对应单采样和 4× SSAA。同一次调用请只使用一种采样选项。不提供 `--config` 时使用固定太阳系；`--body earth` 等选项导出单星近景。质量、长度和时间是无量纲模拟单位；显示半径和 `display_scale` 不改变引力与碰撞半径。旧实验沙盒仍支持通用 `appearance` 字段。REBOUND 使用 GPL-3.0，发布链接后的程序前需核对项目许可证与第三方声明。
+
+### 离线抗锯齿实验
+
+```sh
+./build-headless/planet_aa_benchmark --output-dir build-headless/aa-run-001
+./build-headless/planet_aa_benchmark --config my-solar-system.json --output-dir build-headless/my-aa-run-001 --width 256 --height 192
+```
+
+实验固定地球轮廓、土星环边缘和细轨道线，逐场景对同一快照与相机生成 `single`、`ssaa4`、`msaa4` 和离线 `ssaa16` PNG。每个场景另有 `_edges.png`，白色部分是参考图逐样本几何边缘及其一像素邻域；同一星球的云层与地表按同一几何归属计。`metrics.csv` 的 `edge_mae_linear` 与 `full_mae_linear` 是显示图像解码回 gamma 2.2 线性空间后的平均 RGB 绝对误差；`shade_evaluations` 只统计片元着色，细轨道线为零。每种模式先进行一次不计时预热；`render_ms` 仅计随后一次 CPU 渲染，不含 PNG 写入，适合观察本机趋势，不作为严格性能基准。输出中的 `project.json` 保存本次 DIY 参数。输出路径必须是尚不存在的新目录，全部文件写完后才发布，以免失败重跑混入旧结果。16× 仅用于离线近似参考，不进入桌面实时采样菜单。PNG 使用随项目附带的 `stb_image_write`（Public Domain / MIT）。
+
+### 桌面编辑器
+
+桌面版需要 GLFW 和系统图形开发环境；首次配置会下载 Dear ImGui。Linux 需要 OpenGL 开发包，macOS 需要 Xcode 命令行工具和 Metal。桌面目标默认关闭，可单独启用：
+
+```sh
+cmake -S . -B build-studio -DPLANET_BUILD_DESKTOP=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-studio -j
+./build-studio/planet_studio
+```
+
+不传项目路径时打开固定太阳系，保存路径默认 `my-solar-system.json`；传入旧 JSON 可继续使用实验沙盒。点击画面中的行星、左侧目录项或 `Design selected`，镜头会平滑飞入该星球近景；右侧只显示当前星球已实现的设计参数，可切换 `Show baseline`、`Reset this body`，再用 `Back to system` 平滑返回全景。在近景中左键拖动画笔修改局部形状，右键拖动旋转视角；`Undo sculpt` 撤销所选行星最近的一笔。`Orbit / Physics` 独立编辑质量、碰撞半径、位置和速度。左侧 `Demos` 提供地球地形、土星环边缘和地球与火星碰撞三个一键演示；碰撞演示只对临时地球与火星副本运行 REBOUND，保留当前 DIY 外观，`Play/Pause`、`Step`、`Reset` 只控制演示，`Exit demo` 恢复进入前的选择与视角。演示中 `Save` 仍保存原 DIY 项目，不会写入演示轨道。`Run simulation` 会从设计近景平滑拉远到九体全貌，镜头到达后才开始推进 REBOUND 时间；从模拟返回设计也先冻结画面并拉远。模拟画面中的 `Time` 可暂停并跳到指定时刻，`Reference orbit` 将所选行星的固定目录轨道与当前 DIY 轨道并排标示，碰撞事件可点击回放。参考轨道只用于对照，不改变保存的设计或物理参数。碰撞后较大质量天体继承可见身份，同质量按固定目录顺序。模拟重置恢复九个设计入口。左侧 `Save`/`Load` 控制项目 JSON；窗口操作不会自动改写源文件。场景可拖拽旋转、滚轮缩放；顶部可选择 `1x`、`4x SSAA` 或 `4x MSAA`。勾选 `Inspect` 后点击画面，右侧 `Pixel` 页显示所选像素的 9×9 最近邻放大图与最终样本数据。勾选 `Compare` 可在同一场景快照下并排设置左右采样模式；点击任一栏查看该栏像素，面板同时给出两栏着色次数。检查或对比期间暂停局部雕刻；镜头过渡期间暂停雕刻和画面选择，结束后恢复所选采样模式。
+
+从一颗行星近景直接选择另一颗行星时，镜头先经过太阳系全景，再飞入新星球，避免在星际空白处横移。镜头过渡约 0.9 秒，跨行星过渡约 1.5 秒；实际速度受 CPU 渲染帧率影响。
+
+当前原生窗口只在 Linux 的 Xvfb/OpenGL 环境做过构建与画面检查；Metal 后端仍需在 macOS 本机编译和运行验证。
+
 ## 项目简介
 
 本项目是一个以太阳系为交互场景的 CPU 软件光栅化与抗锯齿分析工具。项目使用 C++ 实现从三维场景到最终图像的关键渲染步骤，以太阳和八大行星构成的动态场景展示变换、投影、纹理、光照、遮挡与采样过程。
@@ -122,6 +174,6 @@
 
 首版限定不透明几何。土星环使用可从两面观察的不透明环带，轨道示意使用细带三角形，两者均进入相同的深度和采样流程。界面文字与标签独立绘制，不计入软件渲染抗锯齿效果的评价区域。
 
-项目不承担真实日期星历、引力动力学求解或精密天文预测。天文资料中的物理参数与用于展示的尺寸、距离分别标注，行星信息参考 NASA 公开资料。
+新加入的沙盒使用无量纲多体引力和碰撞合并，但不承担真实日期星历或精密天文预测。天文资料中的物理参数与用于展示的尺寸、距离分别标注，行星信息参考 NASA 公开资料。
 
 在核心功能稳定后，可按需要扩展 Mipmap、分块并行、SMAA、自动画质调节、真实尺度切换、复杂阴影和光晕。这些扩展不作为基础渲染与采样分析的前置条件。

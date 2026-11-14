@@ -1,0 +1,19 @@
+/build/
+/build-*/
+*.ppm
+
+# Local projects and generated output
+/my-solar-system.json
+/state.json
+*.log
+.DS_Store
+Thumbs.db
+
+# Local planning and agent instructions
+/PROJECT_PLAN.md
+/docs/superpowers/
+/.codex/
+/.claude/
+/.agents/
+/skills/
+/superpowers/
