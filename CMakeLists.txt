@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.21)
 project(planet_sandbox LANGUAGES C CXX)
 
+option(PLANET_BUILD_DESKTOP "Build the native planet editor" OFF)
+if(APPLE AND PLANET_BUILD_DESKTOP)
+    # GLFW uses Objective-C; the Metal frontend uses Objective-C++.
+    # Enable both before creating targets so .m files are not compiled as C++.
+    enable_language(OBJC OBJCXX)
+endif()
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,6 +34,11 @@ file(GLOB REBOUND_SOURCES CONFIGURE_DEPENDS "${rebound_SOURCE_DIR}/src/*.c")
 add_library(rebound STATIC ${REBOUND_SOURCES})
 target_include_directories(rebound PUBLIC "${rebound_SOURCE_DIR}/src")
 target_compile_definitions(rebound PRIVATE _GNU_SOURCE GITHASH=0)
+if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # Preserve separate rounding in REBOUND's compensated gravity calculation.
+    # FMA contraction can stall IAS15 for symmetric initial conditions on macOS.
+    target_compile_options(rebound PRIVATE -ffp-contract=off)
+endif()
 if(WIN32)
     target_compile_definitions(rebound PUBLIC BUILDINGLIBREBOUND)
 endif()
@@ -76,7 +88,6 @@ add_test(NAME planet_aa_benchmark_smoke
             -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/aa_benchmark_smoke.cmake)
 
-option(PLANET_BUILD_DESKTOP "Build the native planet editor" OFF)
 if(PLANET_BUILD_DESKTOP)
     find_package(glfw3 3.3 QUIET)
     if(NOT TARGET glfw)
@@ -103,19 +114,18 @@ if(PLANET_BUILD_DESKTOP)
     target_link_libraries(imgui PUBLIC glfw)
 
     if(APPLE)
-        enable_language(OBJCXX)
         set_source_files_properties(src/studio_metal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
         target_sources(imgui PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm)
-        add_executable(planet_studio src/studio_ui.cpp src/studio_metal.mm)
+        add_executable(planet_studio src/studio_ui.cpp src/studio_measurement.cpp src/studio_metal.mm)
         target_link_libraries(planet_studio PRIVATE planet_core imgui
             "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
     else()
         find_package(OpenGL REQUIRED)
         target_sources(imgui PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
-        add_executable(planet_studio src/studio_ui.cpp src/studio_gl.cpp)
+        add_executable(planet_studio src/studio_ui.cpp src/studio_measurement.cpp src/studio_gl.cpp)
         target_link_libraries(planet_studio PRIVATE planet_core imgui OpenGL::GL)
     endif()
-    add_executable(planet_studio_tests tests/studio_tests.cpp src/studio_ui.cpp)
+    add_executable(planet_studio_tests tests/studio_tests.cpp src/studio_ui.cpp src/studio_measurement.cpp)
     target_link_libraries(planet_studio_tests PRIVATE planet_core imgui)
     if(MSVC)
         target_compile_options(planet_studio_tests PRIVATE /UNDEBUG)

@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
+        std::uint64_t uploaded_frame = 0;
         double previous = glfwGetTime();
         while (!glfwWindowShouldClose(window) && !state.request_close) {
             glfwPollEvents();
@@ -76,11 +77,14 @@ int main(int argc, char** argv) {
             previous = now;
 
             const auto input = planet_sandbox::make_studio_render_input(state);
-            const auto frame = planet_sandbox::render_studio_frame(state, input);
+            const auto& frame = planet_sandbox::update_studio_frame(state, input, now);
             const auto& image = frame.image;
-            glBindTexture(GL_TEXTURE_2D, texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, image.width, image.height, 0,
-                         GL_RGB, GL_UNSIGNED_BYTE, image.rgb.data());
+            if (uploaded_frame != state.frame_cache.render_count) {
+                glBindTexture(GL_TEXTURE_2D, texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, image.width, image.height, 0,
+                             GL_RGB, GL_UNSIGNED_BYTE, image.rgb.data());
+                uploaded_frame = state.frame_cache.render_count;
+            }
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();

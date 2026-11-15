@@ -16,6 +16,7 @@ public:
     explicit SandboxSession(Project project);
 
     const Project& project() const { return project_; }
+    std::uint64_t project_revision() const { return project_revision_; }
     SessionMode mode() const { return mode_; }
     bool playing() const { return playing_; }
     double speed() const { return speed_; }
@@ -37,6 +38,7 @@ public:
 
 private:
     Project project_;
+    std::uint64_t project_revision_ = 0;
     std::unique_ptr<Simulation> simulation_;
     std::unique_ptr<Simulation> reference_simulation_;
     std::vector<CollisionEvent> observed_events_;

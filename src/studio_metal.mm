@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
             ImGui_ImplMetal_Init(device);
 
             std::vector<std::uint8_t> rgba(state.render.width * state.render.height * 4);
+            std::uint64_t uploaded_frame = 0;
             double previous = glfwGetTime();
             while (!glfwWindowShouldClose(window) && !state.request_close) {
                 @autoreleasepool {
@@ -91,16 +92,25 @@ int main(int argc, char** argv) {
                     previous = now;
 
                     const auto input = planet_sandbox::make_studio_render_input(state);
-                    const auto frame = planet_sandbox::render_studio_frame(state, input);
+                    const auto& frame = planet_sandbox::update_studio_frame(state, input, now);
                     const auto& image = frame.image;
-                    for (std::size_t i = 0; i < image.rgb.size() / 3; ++i) {
-                        rgba[4 * i] = image.rgb[3 * i];
-                        rgba[4 * i + 1] = image.rgb[3 * i + 1];
-                        rgba[4 * i + 2] = image.rgb[3 * i + 2];
-                        rgba[4 * i + 3] = 255;
+                    if (uploaded_frame != state.frame_cache.render_count) {
+                        if (preview.width != image.width || preview.height != image.height) {
+                            descriptor.width = image.width;
+                            descriptor.height = image.height;
+                            preview = [device newTextureWithDescriptor:descriptor];
+                        }
+                        rgba.resize(static_cast<std::size_t>(image.width) * image.height * 4);
+                        for (std::size_t i = 0; i < image.rgb.size() / 3; ++i) {
+                            rgba[4 * i] = image.rgb[3 * i];
+                            rgba[4 * i + 1] = image.rgb[3 * i + 1];
+                            rgba[4 * i + 2] = image.rgb[3 * i + 2];
+                            rgba[4 * i + 3] = 255;
+                        }
+                        [preview replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
+                                 mipmapLevel:0 withBytes:rgba.data() bytesPerRow:image.width * 4];
+                        uploaded_frame = state.frame_cache.render_count;
                     }
-                    [preview replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
-                             mipmapLevel:0 withBytes:rgba.data() bytesPerRow:image.width * 4];
 
                     int width = 0, height = 0;
                     glfwGetFramebufferSize(window, &width, &height);

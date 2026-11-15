@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -518,6 +519,10 @@ public:
             frame.image.rgb[pixel * 3 + 1] = to_byte(resolved.g);
             frame.image.rgb[pixel * 3 + 2] = to_byte(resolved.b);
         }
+        return frame;
+    }
+
+    void trace_pixel(RenderFrame& frame) const {
         if (config_.trace_x >= 0 && config_.trace_y >= 0) {
             PixelTrace trace;
             trace.x = config_.trace_x;
@@ -534,7 +539,6 @@ public:
                                  frame.image.rgb[pixel * 3 + 2]};
             frame.trace = std::move(trace);
         }
-        return frame;
     }
 
 private:
@@ -675,6 +679,7 @@ void draw_ring(Rasterizer& rasterizer, const BodyState& body, const Material& ma
 
 RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
                          const RenderConfig& config) {
+    const auto start = std::chrono::steady_clock::now();
     validate_project(project);
     if (config.width <= 0 || config.height <= 0 || config.width > 8192 || config.height > 8192 ||
         !std::isfinite(config.camera.yaw) || !std::isfinite(config.camera.pitch) ||
@@ -797,7 +802,13 @@ RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
         draw_sphere(rasterizer, *cloud.body, material, cloud.index,
                     cloud.scale_factor, snapshot.time);
     }
-    return rasterizer.resolve();
+    RenderFrame frame = rasterizer.resolve();
+    frame.render_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    frame.panel_render_ms[0] = frame.render_ms;
+    frame.panel_sampling[0] = config.sampling;
+    rasterizer.trace_pixel(frame);
+    return frame;
 }
 
 } // namespace planet_sandbox

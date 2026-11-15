@@ -3,13 +3,246 @@
 #error Studio tests require enabled assertions
 #endif
 #include "planet_sandbox/solar_system.h"
+#include <imgui_internal.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <sstream>
 
 using namespace planet_sandbox;
+
+// Exercise the same render/UI order as the desktop with actual mouse events.
+struct StudioUiTest {
+    StudioState state{make_solar_system_project(), "ui-regression.json"};
+    double now = 0.0;
+
+    StudioUiTest() {
+        ImGui::CreateContext();
+        auto& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.DisplaySize = {1280, 800};
+        io.DeltaTime = 1.0f / 60.0f;
+        unsigned char* pixels;
+        int width, height;
+        io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+        state.render.width = 128;
+        state.render.height = 96;
+        activate_studio_preset(state, DemoPreset::EarthTerrain);
+        draw(); draw();
+    }
+    ~StudioUiTest() { ImGui::DestroyContext(); }
+
+    void draw() {
+        now += 1.0 / 60.0;
+        advance_studio(state, 1.0 / 60.0);
+        const auto input = make_studio_render_input(state);
+        const auto& frame = update_studio_frame(state, input, now);
+        ImGui::NewFrame();
+        draw_studio(state, 1, input, frame, false);
+        ImGui::Render();
+    }
+    void click(float x, float y) {
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(x, y); draw();
+        io.AddMouseButtonEvent(0, true); draw();
+        io.AddMouseButtonEvent(0, false); draw();
+    }
+    ImGuiWindow* inspector() const {
+        for (ImGuiWindow* window : GImGui->Windows) {
+            if (std::strstr(window->Name, "/##inspector_")) return window;
+        }
+        assert(false && "Inspector missing");
+        return nullptr;
+    }
+    void click_tab(int index) {
+        auto* window = inspector();
+        const auto* tabs = GImGui->TabBars.GetByKey(window->GetID("##inspector-tabs"));
+        assert(tabs && tabs->Tabs.Size == 3);
+        const auto& tab = tabs->Tabs[index];
+        click(tabs->BarRect.Min.x + tab.Offset + tab.Width / 2, tabs->BarRect.GetCenter().y);
+        draw();
+    }
+    std::string project_text() const {
+        std::ostringstream text;
+        write_project(text, state.session.project());
+        return text.str();
+    }
+};
+
+static void test_pixel_tab_never_sculpts() {
+    StudioUiTest ui;
+    auto& state = ui.state;
+    const auto original = ui.project_text();
+    assert(!state.inspect_pixel && !state.compare_modes && !state.pixel_tab_active);
+    ui.click_tab(2);
+    assert(state.pixel_tab_active && state.inspect_pixel && !state.compare_modes);
+    ui.click(600, 347); // Earth surface in the single view.
+    assert(state.frame_cache.frame->trace);
+    assert(state.selected_pixel_x >= 0 && state.selected_pixel_y >= 0);
+    assert(ui.project_text() == original);
+
+    auto& io = ImGui::GetIO();
+    io.AddMouseButtonEvent(0, true); ui.draw();
+    io.AddMousePosEvent(610, 350); ui.draw();
+    io.AddMousePosEvent(620, 353); ui.draw();
+    io.AddMouseButtonEvent(0, false); ui.draw();
+    assert(ui.project_text() == original);
+
+    ui.click(540, 44); // Explicitly disable Inspect while Pixel remains visible.
+    assert(!state.inspect_pixel && state.pixel_tab_active);
+    ui.click(600, 347);
+    assert(!state.inspect_pixel && !state.frame_cache.frame->trace);
+    assert(ui.project_text() == original);
+
+    state.compare_modes = state.inspect_pixel = true;
+    ui.draw();
+    ui.click(290, 44); // Reset view must keep its existing mode-reset behavior.
+    while (state.camera_transition) ui.draw();
+    ui.draw();
+    assert(!state.compare_modes && !state.inspect_pixel && state.pixel_tab_active);
+    ui.click(600, 347);
+    assert(ui.project_text() == original);
+    assert(!state.frame_cache.frame->trace);
+
+    ui.click_tab(0);
+    assert(!state.pixel_tab_active && !state.inspect_pixel);
+    ui.click(600, 347);
+    assert(ui.project_text() != original); // Normal Design sculpting still works.
+    const auto sculpted = ui.project_text();
+    ui.click_tab(2);
+    ui.click(600, 347);
+    assert(state.inspect_pixel && state.frame_cache.frame->trace);
+    assert(ui.project_text() == sculpted);
+}
+
+static void test_design_slider_and_reset_keep_valid_body_identity() {
+    StudioUiTest ui;
+    auto& state = ui.state;
+    ui.click(600, 347); // Give Reset a sculpt stroke and undo history to clear.
+    assert(!state.session.project().bodies[3].design.sculpt_visible.empty());
+    ui.click(1200, 176); // Relative terrain relief slider in the Design tab.
+    assert(state.session.project().bodies[3].design.relief > 1.0);
+    const auto* inspector = ui.inspector();
+    ui.click(inspector->WorkRect.Min.x + 50,
+             inspector->DC.CursorMaxPos.y - ImGui::GetFrameHeight() / 2);
+    const auto& design = state.session.project().bodies[3].design;
+    assert(design.relief == baseline_design(BodyKind::Earth).relief);
+    assert(design.sculpt_visible.empty());
+    assert(state.notice == "Body reset");
+    auto restored = design;
+    assert(!state.sculpt_history.undo(BodyKind::Earth, restored));
+}
+
+static void test_pixel_keyboard_then_mouse_details() {
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = {1280, 800};
+    io.DeltaTime = 1.0f / 60.0f;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    unsigned char* pixels;
+    int width, height;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    StudioState state(make_solar_system_project(), "keyboard-mouse.json");
+    state.render.width = 128;
+    state.render.height = 96;
+    activate_studio_preset(state, DemoPreset::EarthTerrain);
+    state.compare_modes = state.inspect_pixel = state.select_pixel_tab = true;
+    state.selected_pixel_x = 32;
+    state.selected_pixel_y = 48;
+    auto draw = [&] {
+        const auto input = make_studio_render_input(state);
+        const auto frame = render_studio_frame(state, input);
+        ImGui::NewFrame();
+        draw_studio(state, 1, input, frame, false);
+        ImGui::Render();
+    };
+    auto click = [&](float x, float y) {
+        io.AddMousePosEvent(x, y); draw();
+        io.AddMouseButtonEvent(0, true); draw();
+        io.AddMouseButtonEvent(0, false); draw();
+    };
+    draw(); draw();
+    click(426, 347);
+    const int x = state.selected_pixel_x, y = state.selected_pixel_y;
+    io.AddKeyEvent(ImGuiKey_RightArrow, true); draw();
+    io.AddKeyEvent(ImGuiKey_RightArrow, false); draw();
+    assert(state.selected_pixel_x == x + 1 && state.selected_pixel_y == y);
+    ImGuiWindow* inspector = nullptr;
+    for (ImGuiWindow* window : GImGui->Windows) {
+        if (std::strstr(window->Name, "/##inspector_")) inspector = window;
+    }
+    assert(inspector);
+    auto* tabs = GImGui->TabBars.GetByKey(inspector->GetID("##inspector-tabs"));
+    assert(tabs && tabs->Tabs.Size == 3);
+    const ImGuiID details = ImHashStr("Details", 0, tabs->Tabs[2].ID);
+    assert(inspector->StateStorage.GetInt(details, 0) == 0);
+    // Details is the last control while collapsed; derive its position from layout.
+    click(inspector->WorkRect.Min.x + 50,
+          inspector->DC.CursorMaxPos.y - ImGui::GetFrameHeight() / 2);
+    assert(inspector->StateStorage.GetInt(details, 0) == 1);
+    assert(state.selected_pixel_x == x + 1 && state.selected_pixel_y == y);
+    ImGui::DestroyContext();
+}
+
+// Send real ImGui mouse events to the playback button while Compare freezes time.
+static void test_compare_playback_button_stays_paused() {
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = {1280, 800};
+    io.DeltaTime = 1.0f / 60.0f;
+    unsigned char* pixels;
+    int width, height;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    for (bool collision : {false, true}) {
+        StudioState state(make_solar_system_project(), "compare-playback.json");
+        state.render.width = 128;
+        state.render.height = 96;
+        if (collision) {
+            activate_studio_preset(state, DemoPreset::Collision);
+            state.demos.set_playing(false);
+        } else {
+            state.session.begin_simulation();
+            state.session.set_playing(false);
+        }
+        state.compare_modes = state.inspect_pixel = true;
+        const auto input = make_studio_render_input(state);
+        const auto frame = render_studio_frame(state, input);
+        auto draw = [&] {
+            ImGui::NewFrame();
+            draw_studio(state, 1, input, frame, false);
+            ImGui::Render();
+        };
+        draw(); draw();
+        const auto& style = ImGui::GetStyle();
+        const float preceding = collision
+            ? ImGui::CalcTextSize("COLLISION DEMO").x + style.ItemSpacing.x +
+                ImGui::CalcTextSize("Exit demo").x + style.FramePadding.x * 2
+            : ImGui::CalcTextSize("Design").x + style.FramePadding.x * 2;
+        const float x = 210 + preceding + style.ItemSpacing.x +
+                        (ImGui::CalcTextSize("Play").x + style.FramePadding.x * 2) / 2;
+        const float y = style.WindowPadding.y + ImGui::GetFrameHeight() / 2;
+        auto click_play = [&] {
+            io.AddMousePosEvent(x, y); draw();
+            io.AddMouseButtonEvent(0, true); draw();
+            io.AddMouseButtonEvent(0, false); draw();
+        };
+        click_play();
+        assert(!(collision ? state.demos.playing() : state.session.playing()));
+        advance_studio(state, 0.1);
+        assert(make_studio_render_input(state).snapshot.time == input.snapshot.time);
+        state.compare_modes = false;
+        click_play();
+        assert(collision ? state.demos.playing() : state.session.playing());
+        advance_studio(state, 0.1);
+        assert(make_studio_render_input(state).snapshot.time > input.snapshot.time);
+    }
+    ImGui::DestroyContext();
+}
 
 static void test_design_camera_flight() {
     StudioState state(make_solar_system_project(), "camera-flight.json");
@@ -245,7 +478,235 @@ static void test_collision_scene_selection_keeps_demo_running() {
     assert(state.camera_transition && state.selected == 3);
 }
 
+static void test_pixel_regions_stay_in_matching_panels() {
+    RenderFrame frame;
+    frame.image.width = 64;
+    frame.image.height = 48;
+    frame.panel_count = 2;
+    for (int cells : {9, 17, 25}) {
+        for (int y : {0, 24, 47}) {
+            for (int x : {0, 16, 31}) {
+                const auto left = studio_pixel_region(frame, x, y, cells);
+                const auto right = studio_pixel_region(frame, x + 32, y, cells);
+                assert(left.x == right.x && left.y == right.y && left.size == right.size);
+                assert(left.size == cells);
+                assert(left.x >= 0 && left.x + cells <= 32);
+                assert(left.y >= 0 && left.y + cells <= 48);
+                assert(x >= left.x && x < left.x + cells);
+                assert(y >= left.y && y < left.y + cells);
+            }
+        }
+    }
+    assert(studio_pixel_region(frame, -1, 0, 9).size == 0);
+    assert(studio_pixel_region(frame, 64, 0, 9).size == 0);
+    assert(studio_pixel_region(frame, 0, 48, 9).size == 0);
+    frame.image.width = 8;
+    frame.image.height = 3;
+    assert(studio_pixel_region(frame, 7, 2, 25).size == 3);
+    frame.panel_count = 1;
+    frame.image.width = 64;
+    frame.image.height = 48;
+    const auto single = studio_pixel_region(frame, 63, 47, 25);
+    assert(single.x == 39 && single.y == 23 && single.size == 25);
+}
+
+static void test_comparison_stats_and_preset_switch() {
+    StudioState state(make_solar_system_project(), "pixel-compare.json");
+    state.render.width = 128;
+    state.render.height = 96;
+    activate_studio_preset(state, DemoPreset::EarthTerrain);
+    state.compare_modes = state.inspect_pixel = true;
+    state.compare_left = SamplingMode::SSAA4;
+    state.compare_right = SamplingMode::MSAA4;
+    state.selected_pixel_x = 96;
+    state.selected_pixel_y = 48;
+    const auto input = make_studio_render_input(state);
+    const auto frame = render_studio_frame(state, input);
+    assert(frame.panel_count == 2);
+    assert(frame.image.width == 128 && frame.image.height == 96);
+    assert(frame.panel_sampling[0] == SamplingMode::SSAA4);
+    assert(frame.panel_sampling[1] == SamplingMode::MSAA4);
+    assert(frame.trace && frame.trace->x == 96 && frame.trace->y == 48);
+    for (double time : frame.panel_render_ms) assert(std::isfinite(time) && time > 0.0);
+    assert(frame.render_ms == frame.panel_render_ms[0] + frame.panel_render_ms[1]);
+    assert(frame.panel_shade_evaluations[0] > frame.panel_shade_evaluations[1]);
+    RenderConfig single_config = input.config;
+    single_config.sampling = SamplingMode::MSAA4;
+    single_config.trace_x = 32;
+    const auto single = render_scene(input.project, input.snapshot, single_config);
+    assert(single.panel_count == 1 && single.panel_sampling[0] == SamplingMode::MSAA4);
+    assert(single.panel_render_ms[0] == single.render_ms && single.render_ms > 0.0);
+    for (int y = 0; y < 96; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                assert(single.image.rgb[(y * 64 + x) * 3 + c] ==
+                       frame.image.rgb[(y * 128 + x + 64) * 3 + c]);
+            }
+        }
+    }
+    activate_studio_preset(state, DemoPreset::SaturnRing);
+    assert(state.compare_modes && state.inspect_pixel && state.select_pixel_tab);
+    assert(state.compare_left == SamplingMode::SSAA4 && state.compare_right == SamplingMode::MSAA4);
+    assert(state.selected == 6 && state.selected_pixel_x == 32 && state.selected_pixel_y == 48);
+    activate_studio_preset(state, DemoPreset::Collision);
+    assert(!state.compare_modes && !state.inspect_pixel && state.demos.playing());
+}
+
+static void test_baseline_preview_preserves_edits() {
+    Project project = make_solar_system_project();
+    project.bodies[3].design.relief = 3.5;
+    project.bodies[3].design.color_shift = 0.8;
+    StudioState state(project, "baseline-preview.json");
+    state.render.width = 128;
+    state.render.height = 96;
+    activate_studio_preset(state, DemoPreset::EarthTerrain);
+    const auto custom_input = make_studio_render_input(state);
+    const auto custom = render_studio_frame(state, custom_input);
+    state.compare_baseline = true;
+    const auto baseline_input = make_studio_render_input(state);
+    const auto baseline = render_studio_frame(state, baseline_input);
+    assert(custom.image.rgb != baseline.image.rgb);
+    auto expected_input = custom_input;
+    expected_input.project.bodies[3].design = baseline_design(BodyKind::Earth);
+    assert(baseline.image.rgb == render_studio_frame(state, expected_input).image.rgb);
+    assert(state.session.project().bodies[3].design.relief == 3.5);
+    assert(state.session.project().bodies[3].design.color_shift == 0.8);
+    state.compare_baseline = false;
+    assert(custom.image.rgb == render_studio_frame(state, make_studio_render_input(state)).image.rgb);
+}
+
+static void test_auto_measurement_reuses_frames_and_invalidates() {
+    StudioState state(make_solar_system_project(), "auto-measurement.json");
+    state.render.width = 64;
+    state.render.height = 48;
+    activate_studio_preset(state, DemoPreset::EarthTerrain);
+    state.compare_modes = state.inspect_pixel = true;
+    state.compare_left = SamplingMode::SSAA4;
+    state.compare_right = SamplingMode::MSAA4;
+    state.selected_pixel_x = 16;
+    state.selected_pixel_y = 24;
+    double now = 0.0;
+    auto tick = [&](double seconds = 0.1) -> const RenderFrame& {
+        now += seconds;
+        return update_studio_frame(state, make_studio_render_input(state), now);
+    };
+    auto finish = [&] {
+        assert(state.measurement.waiting);
+        tick(StudioRenderMeasurement::settle_seconds + 0.01);
+        assert(state.measurement.running && state.measurement.completed_runs == 1);
+        for (int i = 1; i < 14; ++i) {
+            tick();
+            assert(state.measurement.ready == (i == 13));
+            assert(state.measurement.samples[0].size() ==
+                   static_cast<std::size_t>(std::max(0, i - 2)));
+        }
+    };
+    tick();
+    assert(state.measurement.waiting && !state.measurement.ready);
+    const auto first_count = state.frame_cache.render_count;
+    tick(0.1);
+    assert(state.measurement.waiting && state.frame_cache.render_count == first_count);
+    finish();
+    // Exactly one displayed render pair for each warm-up/sample; no duplicate pass.
+    assert(state.frame_cache.render_count == first_count + 14);
+    assert(!state.measurement.running);
+    for (int side = 0; side < 2; ++side) {
+        auto values = state.measurement.samples[side];
+        assert(values.size() == 11);
+        for (double value : values) assert(std::isfinite(value) && value > 0);
+        std::sort(values.begin(), values.end());
+        assert(state.measurement.median_ms[side] == values[5]);
+    }
+    const auto reference = render_studio_frame(state, make_studio_render_input(state));
+    assert(state.frame_cache.frame->image.rgb == reference.image.rgb);
+    assert(state.frame_cache.frame->body_index == reference.body_index);
+    const auto medians = state.measurement.median_ms;
+    const auto ready_count = state.frame_cache.render_count;
+    for (int i = 0; i < 5; ++i) tick();
+    state.pixel_region_size = 25;
+    tick();
+    assert(state.frame_cache.render_count == ready_count);
+    state.selected_pixel_x = 50; // Trace changes, but its extraction is outside the timer.
+    const auto& moved = tick();
+    assert(moved.trace && moved.trace->x == 50 && moved.trace->y == 24);
+    assert(moved.image.rgb == reference.image.rgb);
+    assert(state.frame_cache.render_count == ready_count + 1);
+    assert(state.measurement.ready && state.measurement.median_ms == medians);
+
+    auto expect_pending = [&] {
+        tick();
+        assert(state.measurement.waiting && !state.measurement.running && !state.measurement.ready);
+        assert(state.measurement.samples[0].empty() && state.measurement.samples[1].empty());
+    };
+    state.render.camera.yaw += 0.1;
+    expect_pending();
+    // Continuous changes postpone measurement instead of mixing camera poses.
+    for (int i = 0; i < 4; ++i) {
+        state.render.camera.yaw += 0.02;
+        expect_pending();
+    }
+    finish();
+    state.compare_left = SamplingMode::Single;
+    expect_pending();
+    tick(0.3);
+    assert(state.measurement.running);
+    Project edited = state.session.project();
+    edited.bodies[3].design.relief = 2;
+    state.session.replace_project(edited);
+    expect_pending();
+    state.compare_baseline = true;
+    expect_pending();
+    activate_studio_preset(state, DemoPreset::SaturnRing);
+    expect_pending();
+    state.render.width = 96;
+    expect_pending();
+    finish();
+
+    exit_studio_preset(state);
+    state.compare_modes = false;
+    state.inspect_pixel = true;
+    state.session.begin_simulation();
+    const double time = state.session.snapshot().time;
+    advance_studio(state, 0.1);
+    tick();
+    assert(state.session.snapshot().time > time && state.session.playing());
+    assert(!state.measurement.ready && !state.measurement.running && !state.measurement.waiting);
+    state.session.set_playing(false);
+    expect_pending();
+    finish();
+    assert(state.measurement.samples[1].empty());
+    state.session.step(0.025);
+    expect_pending();
+    state.session.set_playing(true);
+    advance_studio(state, 0.1);
+    tick();
+    assert(state.session.playing() && !state.measurement.waiting && !state.measurement.running);
+
+    state.session.return_to_design();
+    activate_studio_preset(state, DemoPreset::Collision);
+    state.inspect_pixel = true;
+    tick();
+    assert(state.demos.playing() && !state.measurement.waiting);
+    state.demos.set_playing(false);
+    expect_pending();
+    finish();
+    state.demos.reset();
+    // Identical snapshots can reuse the result; advancing must invalidate it.
+    tick();
+    assert(state.measurement.ready);
+    state.demos.step(0.025);
+    expect_pending();
+}
+
 int main() {
+    test_pixel_tab_never_sculpts();
+    test_design_slider_and_reset_keep_valid_body_identity();
+    test_pixel_keyboard_then_mouse_details();
+    test_compare_playback_button_stays_paused();
+    test_pixel_regions_stay_in_matching_panels();
+    test_comparison_stats_and_preset_switch();
+    test_baseline_preview_preserves_edits();
+    test_auto_measurement_reuses_frames_and_invalidates();
     test_design_camera_flight();
     test_simulation_waits_for_return_flight();
     test_focus_and_reset_animate_without_losing_playback();

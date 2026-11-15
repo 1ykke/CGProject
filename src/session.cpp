@@ -34,6 +34,7 @@ void SandboxSession::replace_project(Project project) {
     auto next = std::make_unique<Simulation>(project);
     project_ = std::move(project);
     simulation_ = std::move(next);
+    ++project_revision_;
 }
 
 void SandboxSession::add_planet() {
