@@ -134,12 +134,23 @@ bool SculptStroke::begin(const RenderFrame& frame, int body_index, int x, int y)
     active_ = true;
     last_x_ = x;
     last_y_ = y;
+    last_width_ = frame.image.width;
+    last_height_ = frame.image.height;
     return true;
 }
 
 std::vector<Vec2> SculptStroke::move(const RenderFrame& frame, int body_index, int x, int y) {
     std::vector<Vec2> path;
     if (!active_) return path;
+    // Preview refinement can change pixel dimensions during one continuous stroke.
+    if (frame.image.width != last_width_ || frame.image.height != last_height_) {
+        last_x_ = static_cast<int>(std::lround(
+            (last_x_ + 0.5) * frame.image.width / last_width_ - 0.5));
+        last_y_ = static_cast<int>(std::lround(
+            (last_y_ + 0.5) * frame.image.height / last_height_ - 0.5));
+        last_width_ = frame.image.width;
+        last_height_ = frame.image.height;
+    }
     const int dx = x - last_x_, dy = y - last_y_;
     const int steps = static_cast<int>(std::ceil(std::hypot(dx, dy) / 6.0));
     for (int step = 1; step <= steps; ++step) {

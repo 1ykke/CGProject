@@ -1,5 +1,6 @@
 #include "planet_sandbox/renderer.h"
 #include "planet_sandbox/studio_ui.h"
+#include "planet_sandbox/studio_render_pipeline.h"
 #include "planet_sandbox/solar_system.h"
 
 #include <GLFW/glfw3.h>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <exception>
 #include <fstream>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 
@@ -23,19 +25,14 @@ void glfw_error(int code, const char* message) {
     std::fprintf(stderr, "GLFW %d: %s\n", code, message);
 }
 
-planet_sandbox::Project open_project(const char* path) {
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error(std::string("Cannot open project: ") + path);
-    return planet_sandbox::read_project(input);
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const char* path = argc > 1 ? argv[1] : "my-solar-system.json";
-        planet_sandbox::StudioState state(argc > 1 ? open_project(path) :
-                                          planet_sandbox::make_solar_system_project(), path);
+        planet_sandbox::StudioState state(
+            planet_sandbox::open_studio_project(std::filesystem::u8path(path), argc <= 1), path);
+        planet_sandbox::initialize_studio_document(state);
 
         glfwSetErrorCallback(glfw_error);
         if (!glfwInit()) throw std::runtime_error("Could not initialize GLFW");
@@ -69,15 +66,19 @@ int main(int argc, char** argv) {
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
         std::uint64_t uploaded_frame = 0;
+        planet_sandbox::StudioRenderPipeline pipeline;
         double previous = glfwGetTime();
         while (!glfwWindowShouldClose(window) && !state.request_close) {
             glfwPollEvents();
+            state.preview_interacting = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS ||
+                                        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
             const double now = glfwGetTime();
             planet_sandbox::advance_studio(state, std::max(0.0, now - previous));
+            planet_sandbox::update_studio_document(state, std::max(0.0, now - previous));
             previous = now;
 
             const auto input = planet_sandbox::make_studio_render_input(state);
-            const auto& frame = planet_sandbox::update_studio_frame(state, input, now);
+            const auto& frame = pipeline.update(state, input, now);
             const auto& image = frame.image;
             if (uploaded_frame != state.frame_cache.render_count) {
                 glBindTexture(GL_TEXTURE_2D, texture);
@@ -101,6 +102,7 @@ int main(int argc, char** argv) {
             glfwSwapBuffers(window);
         }
 
+        planet_sandbox::shutdown_studio_document(state);
         glDeleteTextures(1, &texture);
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplGlfw_Shutdown();

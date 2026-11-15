@@ -4,6 +4,8 @@
 #include "planet_sandbox/demo_presets.h"
 #include "planet_sandbox/sculpt.h"
 #include "planet_sandbox/session.h"
+#include "planet_sandbox/project_history.h"
+#include "planet_sandbox/project_recovery.h"
 
 #include <imgui.h>
 
@@ -42,6 +44,12 @@ struct StudioRenderMeasurement {
     std::array<double, 2> median_ms{};
 };
 
+struct StudioRenderInput {
+    Project project;
+    SceneSnapshot snapshot;
+    RenderConfig config;
+};
+
 struct StudioFrameCache {
     std::optional<RenderFrame> frame;
     std::string input_key;
@@ -49,12 +57,28 @@ struct StudioFrameCache {
     int trace_y = -1;
     // Also used by frontends to upload only newly rendered images.
     std::uint64_t render_count = 0;
+    std::optional<StudioRenderInput> displayed_input;
+    std::string context_key;
+    bool asynchronous = false;
+    bool preview = false;
 };
 
 struct StudioState {
     StudioState(Project project, const std::string& project_path);
 
     SandboxSession session;
+    ProjectHistory history;
+    std::unique_ptr<RecoveryWriter> recovery_writer;
+    std::filesystem::path document_path;
+    std::optional<RecoveryDraft> recovery_offer;
+    std::optional<std::filesystem::path> pending_load;
+    std::string recovery_error;
+    bool recovery_blocked = false;
+    bool source_unavailable = false;
+    std::string checkpoint_document;
+    std::string protected_document;
+    std::uint64_t document_revision = 0;
+    double document_clock = 0.0, last_document_edit = 0.0, last_checkpoint = 0.0;
     DemoPresets demos;
     RenderConfig render;
     std::array<char, 512> path{};
@@ -76,6 +100,9 @@ struct StudioState {
     bool pixel_tab_active = false;
     StudioRenderMeasurement measurement;
     StudioFrameCache frame_cache;
+    // Explicit scene changes invalidate old jobs without interrupting sculpt revisions.
+    std::uint64_t scene_generation = 0;
+    bool preview_interacting = false;
     bool request_close = false;
     std::optional<StudioCameraTransition> camera_transition;
     SculptMode sculpt_mode = SculptMode::Raise;
@@ -95,12 +122,6 @@ struct StudioState {
         int pixel_y = -1;
     };
     std::optional<SavedView> saved_view;
-};
-
-struct StudioRenderInput {
-    Project project;
-    SceneSnapshot snapshot;
-    RenderConfig config;
 };
 
 // A crop in panel-local coordinates; it never crosses a comparison divider.
@@ -130,6 +151,19 @@ void focus_studio_selected(StudioState& state);
 void reset_studio_view(StudioState& state);
 double studio_timeline_limit(const StudioState& state);
 void seek_studio_time(StudioState& state, double time);
+bool apply_studio_edit(StudioState& state, Project project, const std::string& label,
+                       const std::string& body_id = {}, const std::string& group = {});
+Project open_studio_project(const std::filesystem::path& path, bool create_if_missing);
+bool undo_studio_edit(StudioState& state);
+bool redo_studio_edit(StudioState& state);
+bool save_studio_document(StudioState& state);
+bool load_studio_document(StudioState& state, const std::filesystem::path& path,
+                          bool discard_edits = false);
+void initialize_studio_document(StudioState& state);
+void update_studio_document(StudioState& state, double elapsed_seconds);
+void shutdown_studio_document(StudioState& state);
+bool restore_studio_draft(StudioState& state);
+void discard_studio_draft(StudioState& state);
 
 void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInput& input,
                  const RenderFrame& frame,

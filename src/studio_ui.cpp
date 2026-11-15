@@ -1,4 +1,5 @@
 #include "planet_sandbox/studio_ui.h"
+#include "planet_sandbox/studio_render_pipeline.h"
 #include "planet_sandbox/solar_system.h"
 
 #include <algorithm>
@@ -105,52 +106,18 @@ void select_body(StudioState& state, int index) {
                   state.session.project().bodies[state.selected].name.c_str());
 }
 
-void replace_project(StudioState& state, Project project) {
-    try {
-        state.session.replace_project(std::move(project));
-        state.camera_transition.reset();
-        select_body(state, state.selected);
-        state.notice.clear();
-    } catch (const std::exception& error) {
-        state.notice = error.what();
-    }
+void replace_project(StudioState& state, Project project, const std::string& label = "Edit planet") {
+    const auto body = state.session.project().bodies[state.selected].id;
+    const auto group = ImGui::IsAnyItemActive() ? std::to_string(ImGui::GetItemID()) : std::string{};
+    apply_studio_edit(state, std::move(project), label, body, group);
 }
 
 void save_project(StudioState& state) {
-    try {
-        std::ofstream output(state.path.data());
-        if (!output) throw std::runtime_error("Cannot open project path");
-        write_project(output, state.session.project());
-        output.close();
-        if (!output) throw std::runtime_error("Could not finish saving project");
-        state.notice = "Saved";
-    } catch (const std::exception& error) {
-        state.notice = error.what();
-    }
+    save_studio_document(state);
 }
 
 void load_project(StudioState& state) {
-    try {
-        if (state.session.mode() != SessionMode::Design) {
-            throw std::logic_error("Return to Design before loading");
-        }
-        std::ifstream input(state.path.data());
-        if (!input) throw std::runtime_error("Cannot open project path");
-        Project project = read_project(input);
-        if (state.demos.active() != DemoPreset::None) exit_studio_preset(state);
-        state.session.replace_project(std::move(project));
-        state.camera_transition.reset();
-        state.design_view = false;
-        state.compare_baseline = false;
-        state.render.camera = {};
-        state.sculpt_history.clear();
-        state.sculpt_stroke.end();
-        if (state.session.project().solar_system) state.render.camera.zoom = 0.55;
-        select_body(state, 0);
-        state.notice = "Loaded";
-    } catch (const std::exception& error) {
-        state.notice = error.what();
-    }
+    load_studio_document(state, std::filesystem::u8path(state.path.data()));
 }
 
 float hex_channel(const std::string& hex, int offset) {
@@ -358,7 +325,7 @@ void edit_appearance(StudioState& state) {
     auto update = [&](auto edit) {
         Project next = state.session.project();
         edit(next.bodies[state.selected].appearance);
-        replace_project(state, std::move(next));
+        replace_project(state, std::move(next), "Appearance");
     };
 
     float primary[3] = {hex_channel(current.primary, 1), hex_channel(current.primary, 3),
@@ -385,10 +352,10 @@ void edit_solar_design(StudioState& state) {
     // Editing replaces the project's bodies; keep values, not a reference into them.
     const BodyKind kind = state.session.project().bodies[state.selected].kind;
     const DesignOverrides current = state.session.project().bodies[state.selected].design;
-    const auto update = [&](auto edit) {
+    const auto update = [&](const char* label, auto edit) {
         Project next = state.session.project();
         edit(next.bodies[state.selected].design);
-        replace_project(state, std::move(next));
+        replace_project(state, std::move(next), label);
     };
     auto slider = [&](const char* label, double value, float low, float high, auto edit) {
         ImGui::TextUnformatted(label);
@@ -396,7 +363,7 @@ void edit_solar_design(StudioState& state) {
         ImGui::SetNextItemWidth(-1.0f);
         float candidate = static_cast<float>(value);
         if (ImGui::SliderFloat("##value", &candidate, low, high)) {
-            update([&](DesignOverrides& d) { edit(d, candidate); });
+            update(label, [&](DesignOverrides& d) { edit(d, candidate); });
         }
         ImGui::PopID();
     };
@@ -543,17 +510,14 @@ void edit_solar_design(StudioState& state) {
         }
         ImGui::SliderFloat("Brush size", &state.sculpt_radius, 0.12f, 0.8f);
         ImGui::SliderFloat("Strength", &state.sculpt_strength, 0.1f, 1.0f);
-        if (ImGui::Button("Undo sculpt", ImVec2(-1, 0))) {
-            Project next = state.session.project();
-            if (state.sculpt_history.undo(kind, next.bodies[state.selected].design)) {
-                replace_project(state, std::move(next));
-            }
-            state.sculpt_stroke.end();
-        }
     }
     if (ImGui::Button("Reset this body", ImVec2(-1, 0))) {
         try {
-            state.session.reset_body_design(kind);
+            Project next = state.session.project();
+            next.bodies[state.selected].design = baseline_design(kind);
+            state.history.finish();
+            apply_studio_edit(state, std::move(next), "Reset body",
+                              state.session.project().bodies[state.selected].id);
             state.sculpt_history.clear_body(kind);
             state.sculpt_stroke.end();
             state.notice = "Body reset";
@@ -635,6 +599,24 @@ void draw_sidebar(StudioState& state, float width) {
     ImGui::BeginDisabled(!can_edit);
     if (ImGui::Button("Load", ImVec2(-1, 0))) load_project(state);
     ImGui::EndDisabled();
+    ImGui::TextColored(state.history.dirty() ? ImVec4(1.0f, 0.76f, 0.36f, 1.0f) :
+                                             ImVec4(0.58f, 0.74f, 0.64f, 1.0f),
+                       "%s", state.history.dirty() ? "Unsaved changes" : "No unsaved changes");
+    const bool history_locked = !can_edit || state.compare_baseline;
+    ImGui::BeginDisabled(history_locked || !state.history.can_undo());
+    if (ImGui::Button("Undo", ImVec2((width - 28) * 0.5f, 0))) undo_studio_edit(state);
+    if (state.history.can_undo()) ImGui::SetItemTooltip("Undo: %s", state.history.undo_label().c_str());
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(history_locked || !state.history.can_redo());
+    if (ImGui::Button("Redo", ImVec2(-1, 0))) redo_studio_edit(state);
+    if (state.history.can_redo()) ImGui::SetItemTooltip("Redo: %s", state.history.redo_label().c_str());
+    ImGui::EndDisabled();
+    if (state.recovery_writer) ImGui::TextDisabled("Recovery draft enabled");
+    if (!state.recovery_error.empty()) {
+        ImGui::TextWrapped("%s", state.recovery_error.c_str());
+        if (state.recovery_blocked && ImGui::Button("Discard unreadable draft")) discard_studio_draft(state);
+    }
     if (!state.notice.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, state.notice == "Saved" || state.notice == "Loaded" ||
                                               state.notice == "Body reset"
@@ -905,8 +887,14 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
         state.render.camera.pitch = std::clamp(state.render.camera.pitch + delta.y * 0.006,
                                                -1.3, 1.3);
     }
-    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) state.sculpt_stroke.end();
-    if (sculpting && !state.compare_baseline && mouse_over_scene &&
+    const bool frame_interactive = studio_frame_can_interact(state);
+    if (!frame_interactive) {
+        ImGui::GetWindowDrawList()->AddText({top_left.x + 8.0f, top_left.y + 28.0f},
+            IM_COL32(210, 220, 235, 255),
+            state.frame_cache.displayed_input ? "Updating view..." : "Loading view...");
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || !frame_interactive) state.sculpt_stroke.end();
+    if (frame_interactive && sculpting && !state.compare_baseline && mouse_over_scene &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const ImVec2 mouse = ImGui::GetMousePos();
         const int x = std::clamp(static_cast<int>((mouse.x - top_left.x) / size.x * image_width),
@@ -918,8 +906,7 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
         std::vector<Vec2> dabs;
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             state.sculpt_stroke.begin(frame, state.selected, x, y)) {
-            state.sculpt_history.begin_stroke(kind, state.sculpt_layer,
-                                               state.session.project().bodies[state.selected].design);
+            state.history.finish();
             dabs.push_back(frame.surface_uv[static_cast<std::size_t>(y) * image_width + x]);
         } else {
             dabs = state.sculpt_stroke.move(frame, state.selected, x, y);
@@ -931,10 +918,11 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
                                    state.sculpt_mode, uv.x, uv.y, state.sculpt_radius,
                                    state.sculpt_strength);
             }
-            replace_project(state, std::move(next));
+            replace_project(state, std::move(next), "Sculpt");
         }
     }
-    if (!state.camera_transition && mouse_over_scene && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (frame_interactive && !state.camera_transition && mouse_over_scene &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const ImVec2 mouse = ImGui::GetMousePos();
         const int x = std::clamp(static_cast<int>((mouse.x - top_left.x) / size.x * image_width),
                                  0, image_width - 1);
@@ -950,7 +938,7 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
             if (body >= 0 && !state.design_view) select_studio_scene_body(state, body);
         }
     }
-    if (!state.camera_transition && state.inspect_pixel && ImGui::IsItemFocused() &&
+    if (frame_interactive && !state.camera_transition && state.inspect_pixel && ImGui::IsItemFocused() &&
         state.selected_pixel_x >= 0 && state.selected_pixel_y >= 0) {
         const int panel_width = image_width / frame.panel_count;
         const int panel = std::min(state.selected_pixel_x / panel_width, frame.panel_count - 1);
@@ -1003,7 +991,8 @@ StudioPixelRegion studio_pixel_region(const RenderFrame& frame, int pixel_x, int
 }
 
 StudioState::StudioState(Project project, const std::string& project_path)
-    : session(std::move(project)) {
+    : session(std::move(project)), history(session.project()),
+      document_path(std::filesystem::u8path(project_path)) {
     std::snprintf(path.data(), path.size(), "%s", project_path.c_str());
     if (session.project().solar_system) render.camera.zoom = 0.55;
     select_body(*this, session.project().bodies.size() > 1 ? 1 : 0);
@@ -1259,6 +1248,7 @@ void seek_studio_time(StudioState& state, double time) {
         !std::isfinite(time) || time > 100000.0) return;
     const double target = std::max(0.0, time);
     state.session.seek(target);
+    ++state.scene_generation;
     state.timeline_horizon = std::max(state.timeline_horizon, std::ceil(target));
 }
 
@@ -1301,7 +1291,8 @@ StudioRenderInput make_studio_render_input(const StudioState& state) {
         result.config.trace_x = state.selected_pixel_x;
         result.config.trace_y = state.selected_pixel_y;
     }
-    if (state.camera_transition) result.config.sampling = SamplingMode::Single;
+    if (state.camera_transition && !state.compare_modes && !state.inspect_pixel &&
+        !state.pixel_tab_active) result.config.sampling = SamplingMode::Single;
     return result;
 }
 
@@ -1317,6 +1308,7 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
                  const RenderFrame& frame,
                  bool flip_image_y) {
     const ImGuiIO& io = ImGui::GetIO();
+    update_studio_document(state, 0.0);
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(io.DisplaySize);
     ImGui::Begin("Planet Studio", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -1334,9 +1326,15 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
             state.demos.set_playing(!state.demos.playing());
         }
         ImGui::SameLine();
-        if (ImGui::Button("Step")) state.demos.step(0.025);
+        if (ImGui::Button("Step")) {
+            state.demos.step(0.025);
+            ++state.scene_generation;
+        }
         ImGui::SameLine();
-        if (ImGui::Button("Reset")) state.demos.reset();
+        if (ImGui::Button("Reset")) {
+            state.demos.reset();
+            ++state.scene_generation;
+        }
         ImGui::SameLine();
         float speed = static_cast<float>(state.session.speed());
         ImGui::SetNextItemWidth(130.0f);
@@ -1356,12 +1354,14 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
         ImGui::SameLine();
         if (ImGui::Button("Step")) {
             state.session.step(0.025);
+            ++state.scene_generation;
             state.timeline_horizon = std::max(state.timeline_horizon,
                                                std::ceil(state.session.snapshot().time));
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
             state.session.reset_simulation();
+            ++state.scene_generation;
             state.timeline_horizon = 80.0;
         }
         ImGui::SameLine();
@@ -1383,6 +1383,42 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
                std::max(300.0f, total - sidebar - inspector - 16.0f));
     ImGui::SameLine();
     draw_inspector(state, frame, inspector);
+    if (!io.WantTextInput && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (io.KeyCtrl || io.KeySuper)) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (io.KeyShift) redo_studio_edit(state); else undo_studio_edit(state);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) redo_studio_edit(state);
+    }
+    if (!ImGui::IsAnyItemActive() && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) state.history.finish();
+    update_studio_document(state, 0.0);
+    if (state.recovery_offer && !ImGui::IsPopupOpen("Recover unsaved design")) {
+        ImGui::OpenPopup("Recover unsaved design");
+    }
+    if (ImGui::BeginPopupModal("Recover unsaved design", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("An unsaved design is available from your last session.");
+        if (state.recovery_offer && state.recovery_offer->source_changed) {
+            ImGui::TextUnformatted("The saved project has changed since this draft was created.");
+            ImGui::TextUnformatted("Restoring loads the draft for review; Save updates the project.");
+        }
+        if (ImGui::Button("Restore draft") && restore_studio_draft(state)) ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        if (ImGui::Button("Discard draft")) { discard_studio_draft(state); ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+    if (state.pending_load && !ImGui::IsPopupOpen("Unsaved changes")) ImGui::OpenPopup("Unsaved changes");
+    if (ImGui::BeginPopupModal("Unsaved changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Loading will replace the edits in this view.");
+        ImGui::TextUnformatted("Cancel to save your design first.");
+        if (ImGui::Button("Load and discard edits")) {
+            const auto target = *state.pending_load;
+            state.pending_load.reset();
+            load_studio_document(state, target, true);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { state.pending_load.reset(); ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
     ImGui::End();
 }
 

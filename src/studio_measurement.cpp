@@ -1,7 +1,9 @@
 #include "planet_sandbox/studio_ui.h"
+#include "planet_sandbox/studio_render_pipeline.h"
 
 #include <algorithm>
 #include <type_traits>
+#include <utility>
 
 namespace planet_sandbox {
 namespace {
@@ -16,7 +18,7 @@ std::string measurement_key(const StudioState& state, const StudioRenderInput& i
     };
     auto text = [&](const std::string& value) { add(value.size()); key.append(value); };
     auto point = [&](Vec2 p) { add(p.x); add(p.y); };
-    add(state.session.project_revision()); add(state.session.mode());
+    add(state.session.project_revision()); add(state.scene_generation); add(state.session.mode());
     add(state.demos.active()); add(state.selected); add(state.design_view);
     add(state.compare_baseline); add(state.compare_modes);
     add(input.project.view_extent); add(input.project.display_scale);
@@ -44,13 +46,8 @@ std::string measurement_key(const StudioState& state, const StudioRenderInput& i
     return key;
 }
 
-} // namespace
-
-const RenderFrame& update_studio_frame(StudioState& state, const StudioRenderInput& input,
-                                       double now_seconds) {
+void prepare_measurement(StudioState& state, const std::string& key, double now_seconds) {
     auto& result = state.measurement;
-    auto& cache = state.frame_cache;
-    const auto key = measurement_key(state, input);
     const bool playing = state.demos.active() == DemoPreset::Collision
         ? state.demos.playing() : state.session.playing();
     const bool eligible = !playing && !state.camera_transition &&
@@ -63,11 +60,66 @@ const RenderFrame& update_studio_frame(StudioState& state, const StudioRenderInp
         result.waiting = true;
         result.stable_since = now_seconds;
     }
-    if (result.waiting && now_seconds - result.stable_since >=
+    // A pixel click does not change the image or invalidate a completed median.
+    // Pause unfinished measurements while the pointer is held, retaining valid samples.
+    if (state.preview_interacting && !result.ready && eligible) {
+        result.running = false;
+        result.waiting = true;
+        result.stable_since = now_seconds;
+    }
+    if (result.waiting && !state.preview_interacting && now_seconds - result.stable_since >=
                            StudioRenderMeasurement::settle_seconds) {
         result.waiting = false;
         result.running = true;
     }
+}
+
+void record_measurement(StudioRenderMeasurement& result, const RenderFrame& frame) {
+    if (result.completed_runs >= StudioRenderMeasurement::warmup_runs) {
+        for (int panel = 0; panel < frame.panel_count; ++panel) {
+            result.samples[panel].push_back(frame.panel_render_ms[panel]);
+        }
+    }
+    ++result.completed_runs;
+    if (result.completed_runs == StudioRenderMeasurement::warmup_runs +
+                                 StudioRenderMeasurement::sample_runs) {
+        for (int panel = 0; panel < frame.panel_count; ++panel) {
+            auto sorted = result.samples[panel];
+            std::sort(sorted.begin(), sorted.end());
+            result.median_ms[panel] = sorted[sorted.size() / 2];
+        }
+        result.running = false;
+        result.ready = true;
+    }
+}
+
+std::string context_key(const StudioState& state, const StudioRenderInput& input) {
+    std::string key;
+    auto add = [&](auto value) {
+        key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    add(state.scene_generation); add(state.selected); add(state.design_view); add(state.session.mode());
+    add(state.demos.active()); add(state.compare_baseline); add(state.compare_modes);
+    add(state.compare_modes || state.inspect_pixel || state.pixel_tab_active);
+    add(state.render.sampling); add(state.compare_left); add(state.compare_right);
+    add(input.config.width); add(input.config.height);
+    add(input.project.view_extent); add(input.project.display_scale); add(input.project.solar_system);
+    add(state.show_reference_orbit);
+    for (const auto& body : input.project.bodies) {
+        add(body.id.size()); key.append(body.id); add(body.kind); add(body.display_radius);
+    }
+    return key;
+}
+
+} // namespace
+
+const RenderFrame& update_studio_frame(StudioState& state, const StudioRenderInput& input,
+                                       double now_seconds) {
+    auto& result = state.measurement;
+    auto& cache = state.frame_cache;
+    cache.asynchronous = false;
+    const auto key = measurement_key(state, input);
+    prepare_measurement(state, key, now_seconds);
 
     const bool needs_render = !cache.frame || cache.input_key != key || result.running ||
         cache.trace_x != input.config.trace_x || cache.trace_y != input.config.trace_y;
@@ -83,26 +135,154 @@ const RenderFrame& update_studio_frame(StudioState& state, const StudioRenderInp
         cache.trace_y = input.config.trace_y;
         ++cache.render_count;
         if (result.running) {
-            const auto& frame = *cache.frame;
-            if (result.completed_runs >= StudioRenderMeasurement::warmup_runs) {
-                for (int panel = 0; panel < frame.panel_count; ++panel) {
-                    result.samples[panel].push_back(frame.panel_render_ms[panel]);
-                }
-            }
-            ++result.completed_runs;
-            if (result.completed_runs == StudioRenderMeasurement::warmup_runs +
-                                         StudioRenderMeasurement::sample_runs) {
-                for (int panel = 0; panel < frame.panel_count; ++panel) {
-                    auto sorted = result.samples[panel];
-                    std::sort(sorted.begin(), sorted.end());
-                    result.median_ms[panel] = sorted[sorted.size() / 2];
-                }
-                result.running = false;
-                result.ready = true;
-            }
+            record_measurement(result, *cache.frame);
         }
     }
     return *cache.frame;
+}
+
+struct StudioRenderPipeline::Impl {
+    StudioRenderWorker worker;
+    std::string motion_key;
+    std::string last_key;
+    std::string failed_key;
+    std::string error_notice;
+    double changed_at = -1.0;
+    std::uint64_t submitted = 0;
+    std::uint64_t published = 0;
+    bool in_flight = false;
+
+    explicit Impl(StudioRenderWorker::RenderFunction render) : worker(std::move(render)) {}
+};
+
+StudioRenderPipeline::StudioRenderPipeline(StudioRenderWorker::RenderFunction render)
+    : impl_(std::make_unique<Impl>(std::move(render))) {}
+
+StudioRenderPipeline::~StudioRenderPipeline() = default;
+
+const RenderFrame& StudioRenderPipeline::update(StudioState& state,
+                                                const StudioRenderInput& input,
+                                                double now_seconds) {
+    auto& pipeline = *impl_;
+    auto& cache = state.frame_cache;
+    cache.asynchronous = true;
+    const auto full_key = measurement_key(state, input);
+    const auto context = context_key(state, input);
+    if (!pipeline.motion_key.empty() && pipeline.motion_key != full_key) {
+        pipeline.changed_at = now_seconds;
+    }
+    pipeline.motion_key = full_key;
+    const bool playing = state.demos.active() == DemoPreset::Collision
+        ? state.demos.playing() : state.session.playing();
+    const bool analysis = state.compare_modes || state.inspect_pixel || state.pixel_tab_active;
+    if (playing || state.camera_transition || state.preview_interacting) {
+        pipeline.changed_at = now_seconds;
+    }
+    const bool preview = !analysis && (playing || state.camera_transition ||
+        state.preview_interacting || (pipeline.changed_at >= 0.0 &&
+            now_seconds - pipeline.changed_at < refine_delay_seconds));
+    prepare_measurement(state, full_key, now_seconds);
+
+    if (auto completed = pipeline.worker.poll()) {
+        if (completed->request.serial == pipeline.submitted) pipeline.in_flight = false;
+        if (completed->request.context_key == context &&
+            completed->request.serial > pipeline.published) {
+            if (completed->error) {
+                pipeline.failed_key = completed->request.key;
+                try {
+                    std::rethrow_exception(completed->error);
+                } catch (const std::exception& error) {
+                    pipeline.error_notice = std::string("Preview failed: ") + error.what();
+                } catch (...) {
+                    pipeline.error_notice = "Preview failed: unknown rendering error";
+                }
+                state.notice = pipeline.error_notice;
+            } else {
+                if (completed->request.measuring && state.measurement.running &&
+                    completed->request.measurement_key == full_key) {
+                    record_measurement(state.measurement, *completed->frame);
+                }
+                cache.frame = std::move(completed->frame);
+                cache.displayed_input = std::move(completed->request.input);
+                cache.context_key = context;
+                cache.input_key = completed->request.key;
+                cache.preview = completed->request.preview;
+                ++cache.render_count;
+                pipeline.published = completed->request.serial;
+                if (!pipeline.error_notice.empty() && state.notice == pipeline.error_notice) {
+                    state.notice.clear();
+                }
+                pipeline.error_notice.clear();
+            }
+        }
+    }
+
+    StudioRenderRequest request;
+    request.input = input;
+    request.context_key = context;
+    request.measurement_key = full_key;
+    request.preview = preview;
+    request.compare_modes = state.compare_modes;
+    request.left = state.compare_left;
+    request.right = state.compare_right;
+    request.right_first = state.measurement.completed_runs % 2 != 0;
+    request.measuring = state.measurement.running;
+    if (preview) {
+        request.input.config.width = std::max(1, input.config.width / 2);
+        request.input.config.height = std::max(1, input.config.height / 2);
+        request.input.config.sampling = SamplingMode::Single;
+    }
+    request.key = measurement_key(state, request.input) + context;
+    request.key.append(reinterpret_cast<const char*>(&input.config.trace_x), sizeof(int));
+    request.key.append(reinterpret_cast<const char*>(&input.config.trace_y), sizeof(int));
+    if (request.key != pipeline.failed_key) pipeline.failed_key.clear();
+    if (request.key != pipeline.failed_key &&
+        (request.key != pipeline.last_key || (state.measurement.running && !pipeline.in_flight))) {
+        pipeline.last_key = request.key;
+        pipeline.submitted = pipeline.worker.submit(std::move(request));
+        pipeline.in_flight = true;
+    } else if (request.key == pipeline.failed_key) {
+        state.measurement.waiting = state.measurement.running = false;
+    }
+
+    if (!cache.frame) {
+        // A neutral first frame keeps the editor usable while assets load in the worker.
+        RenderFrame placeholder;
+        placeholder.image.width = std::max(1, input.config.width * (state.compare_modes ? 2 : 1));
+        placeholder.image.height = std::max(1, input.config.height);
+        const std::size_t pixels = static_cast<std::size_t>(placeholder.image.width) *
+                                   placeholder.image.height;
+        placeholder.image.rgb.assign(pixels * 3, 15);
+        placeholder.body_index.assign(pixels, -1);
+        placeholder.surface_uv.assign(pixels, {-1.0, -1.0});
+        cache.frame = std::move(placeholder);
+        ++cache.render_count;
+    }
+    return *cache.frame;
+}
+
+bool studio_frame_can_interact(const StudioState& state) {
+    const auto& cache = state.frame_cache;
+    if (!cache.asynchronous) return true;
+    if (!cache.displayed_input) return false;
+    const auto current = make_studio_render_input(state);
+    if (cache.context_key != context_key(state, current)) return false;
+    const auto& shown_snapshot = cache.displayed_input->snapshot;
+    const auto& desired_snapshot = current.snapshot;
+    if (shown_snapshot.time != desired_snapshot.time ||
+        shown_snapshot.bodies.size() != desired_snapshot.bodies.size()) return false;
+    for (std::size_t i = 0; i < shown_snapshot.bodies.size(); ++i) {
+        const auto& shown_body = shown_snapshot.bodies[i];
+        const auto& desired_body = desired_snapshot.bodies[i];
+        if (shown_body.id != desired_body.id || shown_body.radius != desired_body.radius ||
+            shown_body.position.x != desired_body.position.x ||
+            shown_body.position.y != desired_body.position.y) return false;
+    }
+    const auto& shown = cache.displayed_input->config.camera;
+    const auto& desired = current.config.camera;
+    return shown.yaw == desired.yaw && shown.pitch == desired.pitch &&
+           shown.zoom == desired.zoom && shown.target.x == desired.target.x &&
+           shown.target.y == desired.target.y;
 }
 
 } // namespace planet_sandbox

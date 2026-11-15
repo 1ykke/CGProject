@@ -42,6 +42,8 @@ private:
     bool active_ = false;
     int last_x_ = 0;
     int last_y_ = 0;
+    int last_width_ = 0;
+    int last_height_ = 0;
 };
 
 } // namespace planet_sandbox

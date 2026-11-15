@@ -1,4 +1,5 @@
 #include "planet_sandbox/studio_ui.h"
+#include "planet_sandbox/studio_render_pipeline.h"
 #ifdef NDEBUG
 #error Studio tests require enabled assertions
 #endif
@@ -11,6 +12,10 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <chrono>
+#include <thread>
+#include <filesystem>
+#include <fstream>
 
 using namespace planet_sandbox;
 
@@ -18,6 +23,7 @@ using namespace planet_sandbox;
 struct StudioUiTest {
     StudioState state{make_solar_system_project(), "ui-regression.json"};
     double now = 0.0;
+    bool hold_frame = false;
 
     StudioUiTest() {
         ImGui::CreateContext();
@@ -39,7 +45,8 @@ struct StudioUiTest {
         now += 1.0 / 60.0;
         advance_studio(state, 1.0 / 60.0);
         const auto input = make_studio_render_input(state);
-        const auto& frame = update_studio_frame(state, input, now);
+        const auto& frame = hold_frame ? *state.frame_cache.frame
+                                      : update_studio_frame(state, input, now);
         ImGui::NewFrame();
         draw_studio(state, 1, input, frame, false);
         ImGui::Render();
@@ -71,6 +78,63 @@ struct StudioUiTest {
         return text.str();
     }
 };
+
+static void test_stale_async_view_blocks_sculpt_and_pixel_selection() {
+    StudioUiTest ui;
+    auto& state = ui.state;
+    StudioRenderPipeline pipeline;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    do {
+        pipeline.update(state, make_studio_render_input(state), ui.now);
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (!studio_frame_can_interact(state));
+    ui.hold_frame = true; // Keep displaying the last completed image during a slow render.
+    const auto unsculpted = ui.project_text();
+    ui.click(600, 347);
+    assert(ui.project_text() != unsculpted);
+    assert(studio_frame_can_interact(state)); // Sculpt revisions keep the displayed UVs usable.
+    const auto original = ui.project_text();
+    state.render.camera.yaw += 0.4;
+    assert(!studio_frame_can_interact(state));
+    ui.click(600, 347);
+    assert(ui.project_text() == original);
+    state.inspect_pixel = true;
+    state.selected_pixel_x = state.selected_pixel_y = -1;
+    ui.click(600, 347);
+    assert(state.selected_pixel_x == -1 && state.selected_pixel_y == -1);
+}
+
+static void test_loading_same_catalog_rejects_old_async_view() {
+    StudioUiTest ui;
+    auto& state = ui.state;
+    exit_studio_preset(state);
+    state.design_view = false;
+    state.selected = 0;
+    state.render.camera = {};
+    state.render.camera.zoom = 0.55;
+    StudioRenderPipeline pipeline;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    do {
+        pipeline.update(state, make_studio_render_input(state), ui.now);
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (!studio_frame_can_interact(state));
+    ui.hold_frame = true;
+    const auto path = std::filesystem::temp_directory_path() /
+        ("planet-ui-load-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    {
+        std::ofstream output(path);
+        write_project(output, state.session.project());
+    }
+    const auto name = path.string();
+    assert(name.size() < state.path.size());
+    std::strcpy(state.path.data(), name.c_str());
+    ui.click(180, 277); // Load the same catalog and camera while the old image is held.
+    std::filesystem::remove(path);
+    assert(state.notice == "Loaded");
+    assert(!studio_frame_can_interact(state));
+}
 
 static void test_pixel_tab_never_sculpts() {
     StudioUiTest ui;
@@ -134,6 +198,60 @@ static void test_design_slider_and_reset_keep_valid_body_identity() {
     assert(state.notice == "Body reset");
     auto restored = design;
     assert(!state.sculpt_history.undo(BodyKind::Earth, restored));
+}
+
+static void test_parameter_drag_is_one_undo_step_and_redo_restores_it() {
+    StudioUiTest ui;
+    auto& state = ui.state;
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(1060, 176); ui.draw();
+    io.AddMouseButtonEvent(0, true); ui.draw();
+    io.AddMousePosEvent(1120, 176); ui.draw();
+    io.AddMousePosEvent(1200, 176); ui.draw();
+    io.AddMouseButtonEvent(0, false); ui.draw();
+    const auto relief = state.session.project().bodies[3].design.relief;
+    assert(relief > 1.0 && state.history.dirty());
+    assert(state.history.undo_count() == 1);
+    assert(undo_studio_edit(state));
+    assert(state.session.project().bodies[3].design.relief == 1.0 && !state.history.dirty());
+    assert(redo_studio_edit(state));
+    assert(state.session.project().bodies[3].design.relief == relief);
+    ui.click(600, 347);
+    assert(!state.session.project().bodies[3].design.sculpt_visible.empty());
+    assert(undo_studio_edit(state));
+    assert(state.session.project().bodies[3].design.sculpt_visible.empty());
+    assert(state.session.project().bodies[3].design.relief == relief);
+    io.AddMousePosEvent(1200, 176); ui.draw();
+    io.AddMouseButtonEvent(0, true); ui.draw();
+    io.AddMousePosEvent(1150, 176); ui.draw();
+    io.AddMouseButtonEvent(0, false); ui.draw();
+    assert(!state.history.can_redo());
+}
+
+static void test_history_shortcuts_respect_text_input() {
+    StudioUiTest ui;
+    auto& state = ui.state;
+    auto& io = ImGui::GetIO();
+    ui.click(1200, 176);
+    const auto relief = state.session.project().bodies[3].design.relief;
+    assert(relief > 1.0 && state.history.can_undo());
+    const auto shortcut = [&](ImGuiKey key, bool shift = false) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiMod_Shift, shift);
+        io.AddKeyEvent(key, true); ui.draw();
+        io.AddKeyEvent(key, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        io.AddKeyEvent(ImGuiMod_Shift, false); ui.draw();
+    };
+    shortcut(ImGuiKey_Z);
+    assert(state.session.project().bodies[3].design.relief == 1.0);
+    shortcut(ImGuiKey_Z, true);
+    assert(state.session.project().bodies[3].design.relief == relief);
+    ui.click(70, 253);
+    ui.draw();
+    assert(io.WantTextInput);
+    shortcut(ImGuiKey_Z);
+    assert(state.session.project().bodies[3].design.relief == relief);
 }
 
 static void test_pixel_keyboard_then_mouse_details() {
@@ -699,6 +817,10 @@ static void test_auto_measurement_reuses_frames_and_invalidates() {
 }
 
 int main() {
+    test_history_shortcuts_respect_text_input();
+    test_parameter_drag_is_one_undo_step_and_redo_restores_it();
+    test_loading_same_catalog_rejects_old_async_view();
+    test_stale_async_view_blocks_sculpt_and_pixel_selection();
     test_pixel_tab_never_sculpts();
     test_design_slider_and_reset_keep_valid_body_identity();
     test_pixel_keyboard_then_mouse_details();
