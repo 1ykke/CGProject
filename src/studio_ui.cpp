@@ -171,6 +171,7 @@ const char* sampling_name(SamplingMode mode) {
     case SamplingMode::Single: return "1x";
     case SamplingMode::SSAA4: return "4x SSAA";
     case SamplingMode::MSAA4: return "4x MSAA";
+    case SamplingMode::SSAA16: return "16x SSAA";
     }
     return "Unknown";
 }
@@ -196,6 +197,17 @@ void sampling_combo(const char* label, SamplingMode& selected) {
     ImGui::EndCombo();
 }
 
+bool playback_button(bool playing, bool comparing) {
+    ImGui::BeginDisabled(comparing);
+    const bool pressed = ImGui::Button(playing ? "Pause" : "Play");
+    ImGui::EndDisabled();
+    if (comparing && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Compare pauses playback. Uncheck Compare to play.\n"
+                          "Step and Reset can still change the snapshot.");
+    }
+    return pressed;
+}
+
 ImVec4 display_color(const std::array<double, 3>& linear) {
     const auto channel = [](double value) {
         return static_cast<float>(std::pow(std::clamp(value, 0.0, 1.0), 1.0 / 2.2));
@@ -203,47 +215,114 @@ ImVec4 display_color(const std::array<double, 3>& linear) {
     return {channel(linear[0]), channel(linear[1]), channel(linear[2]), 1.0f};
 }
 
-void draw_pixel_inspector(const StudioState& state, const RenderFrame& frame) {
-    if (state.compare_modes) {
-        ImGui::Text("Left shades: %llu",
-                    static_cast<unsigned long long>(frame.panel_shade_evaluations[0]));
-        ImGui::Text("Right shades: %llu",
-                    static_cast<unsigned long long>(frame.panel_shade_evaluations[1]));
-    } else {
-        ImGui::Text("Shade evaluations: %llu",
-                    static_cast<unsigned long long>(frame.shade_evaluations));
-    }
-    if (!frame.trace) {
-        ImGui::TextDisabled("No pixel selected");
-        return;
-    }
-    const PixelTrace& trace = *frame.trace;
-    ImGui::Text("Pixel (%d, %d)", trace.x, trace.y);
-    ImGui::SameLine();
-    ImGui::Text("RGB %u, %u, %u", trace.display_rgb[0], trace.display_rgb[1],
-                trace.display_rgb[2]);
-
-    constexpr int cells = 9;
-    constexpr float cell_size = 16.0f;
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(cells * cell_size, cells * cell_size));
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    for (int row = 0; row < cells; ++row) {
-        for (int col = 0; col < cells; ++col) {
-            const int x = std::clamp(trace.x + col - cells / 2, 0, frame.image.width - 1);
-            const int y = std::clamp(trace.y + row - cells / 2, 0, frame.image.height - 1);
-            const std::size_t pixel = (static_cast<std::size_t>(y) * frame.image.width + x) * 3;
-            const ImU32 color = IM_COL32(frame.image.rgb[pixel], frame.image.rgb[pixel + 1],
-                                         frame.image.rgb[pixel + 2], 255);
-            const ImVec2 a(origin.x + col * cell_size, origin.y + row * cell_size);
-            const ImVec2 b(a.x + cell_size, a.y + cell_size);
-            draw->AddRectFilled(a, b, color);
+void draw_pixel_inspector(StudioState& state, const RenderFrame& frame) {
+    ImGui::SeparatorText("Pixel zoom");
+    ImGui::SetNextItemWidth(100.0f);
+    const char* region_label = state.pixel_region_size == 9 ? "9 x 9" :
+                               state.pixel_region_size == 17 ? "17 x 17" : "25 x 25";
+    if (ImGui::BeginCombo("Region", region_label)) {
+        for (int cells : {9, 17, 25}) {
+            const std::string label = std::to_string(cells) + " x " + std::to_string(cells);
+            if (ImGui::Selectable(label.c_str(), state.pixel_region_size == cells)) {
+                state.pixel_region_size = cells;
+            }
         }
+        ImGui::EndCombo();
     }
-    draw->AddRect({origin.x + 4 * cell_size, origin.y + 4 * cell_size},
-                  {origin.x + 5 * cell_size, origin.y + 5 * cell_size},
-                  IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
+    ImGui::SetItemTooltip("Number of source pixels. Both views use nearest-neighbor magnification.");
+    const int panels = frame.panel_count;
+    const int panel_width = frame.image.width / panels;
+    const auto region = frame.trace
+        ? studio_pixel_region(frame, frame.trace->x, frame.trace->y, state.pixel_region_size)
+        : StudioPixelRegion{};
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (region.size > 0) {
+        const float gap = ImGui::GetStyle().ItemSpacing.x;
+        const float cell_size = std::max(1.0f, std::floor(
+            (ImGui::GetContentRegionAvail().x - gap * (panels - 1)) / panels / region.size));
+        const int local_x = frame.trace->x % panel_width;
+        for (int panel = 0; panel < panels; ++panel) {
+            if (panel > 0) ImGui::SameLine(0, gap);
+            ImGui::BeginGroup();
+            ImGui::Text("%s%s", panels == 2 ? (panel == 0 ? "L " : "R ") : "",
+                        sampling_name(frame.panel_sampling[panel]));
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(region.size * cell_size, region.size * cell_size));
+            for (int row = 0; row < region.size; ++row) {
+                for (int col = 0; col < region.size; ++col) {
+                    const int x = panel * panel_width + region.x + col;
+                    const int y = region.y + row;
+                    const std::size_t pixel = (static_cast<std::size_t>(y) * frame.image.width + x) * 3;
+                    const ImU32 color = IM_COL32(frame.image.rgb[pixel], frame.image.rgb[pixel + 1],
+                                                 frame.image.rgb[pixel + 2], 255);
+                    const ImVec2 a(origin.x + col * cell_size, origin.y + row * cell_size);
+                    draw->AddRectFilled(a, {a.x + cell_size, a.y + cell_size}, color);
+                }
+            }
+            const ImVec2 center(origin.x + (local_x - region.x) * cell_size,
+                                 origin.y + (frame.trace->y - region.y) * cell_size);
+            draw->AddRect(center, {center.x + cell_size, center.y + cell_size},
+                          IM_COL32(255, 255, 255, 255), 0.0f, 0, 1.0f);
+            ImGui::EndGroup();
+        }
+    } else {
+        ImGui::TextWrapped("%s", state.inspect_pixel
+            ? "Click the scene to inspect a pixel."
+            : "Enable Inspect to select a pixel.");
+    }
+
     ImGui::Spacing();
+    ImGui::SeparatorText("Frame cost");
+    if (ImGui::BeginTable("##frame-cost", 3, ImGuiTableFlags_BordersInnerH |
+                                               ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Method", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Shades", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Time (ms)", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+        ImGui::TableHeadersRow();
+        for (int panel = 0; panel < panels; ++panel) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%s%s", panels == 2 ? (panel == 0 ? "L " : "R ") : "",
+                        sampling_name(frame.panel_sampling[panel]));
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(panels == 2
+                ? frame.panel_shade_evaluations[panel] : frame.shade_evaluations));
+            ImGui::TableNextColumn();
+            if (state.measurement.ready) ImGui::Text("%.2f", state.measurement.median_ms[panel]);
+            else ImGui::TextDisabled("--");
+        }
+        ImGui::EndTable();
+    }
+    const auto& measurement = state.measurement;
+    if (measurement.running) {
+        ImGui::TextDisabled("Measuring... %d/%d", std::max(0, measurement.completed_runs -
+            StudioRenderMeasurement::warmup_runs), StudioRenderMeasurement::sample_runs);
+    } else if (measurement.waiting) {
+        ImGui::TextDisabled("Waiting for a steady view...");
+    } else if (!measurement.ready) {
+        ImGui::TextDisabled("Pause to measure automatically.");
+    }
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Time (ms): median of %d renders (CPU only)", StudioRenderMeasurement::sample_runs);
+    ImGui::PopTextWrapPos();
+    ImGui::SetItemTooltip("Automatically measures a stationary view: 3 warm-up renders, then 11 timed renders. "
+                         "The median stays fixed until the scene, view or sampling method changes. "
+                         "Excludes pixel-trace extraction, image upload, comparison stitching and UI. "
+                         "Moving the pixel selection or changing Region keeps the timing result.");
+    ImGui::TextDisabled("%d x %d per view", panel_width, frame.image.height);
+    ImGui::Spacing();
+    if (!ImGui::CollapsingHeader("Details") || !frame.trace) return;
+    const PixelTrace& trace = *frame.trace;
+    ImGui::Text("Pixel (%d, %d)", trace.x % panel_width, trace.y);
+    for (int panel = 0; panel < panels; ++panel) {
+        const std::size_t pixel = (static_cast<std::size_t>(trace.y) * frame.image.width +
+                                   panel * panel_width + trace.x % panel_width) * 3;
+        ImGui::Text("%sRGB %u, %u, %u", panels == 2 ? (panel == 0 ? "Left " : "Right ") : "",
+                    frame.image.rgb[pixel], frame.image.rgb[pixel + 1], frame.image.rgb[pixel + 2]);
+    }
+    ImGui::TextDisabled("Filter: Nearest neighbor");
+    if (panels == 2) ImGui::TextDisabled("Samples: %s view (clicked side)",
+                                        trace.x < panel_width ? "left" : "right");
     ImGui::SeparatorText("Samples");
     const ImVec2 diagram = ImGui::GetCursorScreenPos();
     ImGui::Dummy(ImVec2(112.0f, 112.0f));
@@ -303,8 +382,9 @@ void edit_appearance(StudioState& state) {
 }
 
 void edit_solar_design(StudioState& state) {
-    const auto& body = state.session.project().bodies[state.selected];
-    const DesignOverrides current = body.design;
+    // Editing replaces the project's bodies; keep values, not a reference into them.
+    const BodyKind kind = state.session.project().bodies[state.selected].kind;
+    const DesignOverrides current = state.session.project().bodies[state.selected].design;
     const auto update = [&](auto edit) {
         Project next = state.session.project();
         edit(next.bodies[state.selected].design);
@@ -320,7 +400,7 @@ void edit_solar_design(StudioState& state) {
         }
         ImGui::PopID();
     };
-    switch (body.kind) {
+    switch (kind) {
     case BodyKind::Sun:
         ImGui::SeparatorText("Photosphere");
         slider("Artistic photosphere relief", current.relief, 0.0f, 4.0f,
@@ -451,7 +531,7 @@ void edit_solar_design(StudioState& state) {
         if (ImGui::RadioButton("Smooth", state.sculpt_mode == SculptMode::Smooth)) {
             state.sculpt_mode = SculptMode::Smooth;
         }
-        if (body.kind == BodyKind::Venus) {
+        if (kind == BodyKind::Venus) {
             if (ImGui::RadioButton("Cloud top", state.sculpt_layer == SolarShapeLayer::Visible)) {
                 state.sculpt_layer = SolarShapeLayer::Visible;
             }
@@ -465,7 +545,7 @@ void edit_solar_design(StudioState& state) {
         ImGui::SliderFloat("Strength", &state.sculpt_strength, 0.1f, 1.0f);
         if (ImGui::Button("Undo sculpt", ImVec2(-1, 0))) {
             Project next = state.session.project();
-            if (state.sculpt_history.undo(body.kind, next.bodies[state.selected].design)) {
+            if (state.sculpt_history.undo(kind, next.bodies[state.selected].design)) {
                 replace_project(state, std::move(next));
             }
             state.sculpt_stroke.end();
@@ -473,8 +553,8 @@ void edit_solar_design(StudioState& state) {
     }
     if (ImGui::Button("Reset this body", ImVec2(-1, 0))) {
         try {
-            state.session.reset_body_design(body.kind);
-            state.sculpt_history.clear_body(body.kind);
+            state.session.reset_body_design(kind);
+            state.sculpt_history.clear_body(kind);
             state.sculpt_stroke.end();
             state.notice = "Body reset";
         }
@@ -581,20 +661,32 @@ void draw_sidebar(StudioState& state, float width) {
     ImGui::EndDisabled();
     if (state.session.project().solar_system) {
         ImGui::Spacing();
-        ImGui::SeparatorText("Demos");
+        ImGui::SeparatorText("Demo presets");
         ImGui::BeginDisabled(state.session.mode() != SessionMode::Design);
-        if (ImGui::Button("Earth terrain", ImVec2(-1, 0))) {
-            activate_studio_preset(state, DemoPreset::EarthTerrain);
-        }
-        if (ImGui::Button("Saturn ring edge", ImVec2(-1, 0))) {
-            activate_studio_preset(state, DemoPreset::SaturnRing);
-        }
-        if (ImGui::Button("Planet collision", ImVec2(-1, 0))) {
-            activate_studio_preset(state, DemoPreset::Collision);
+        const DemoPreset active = state.demos.active();
+        const char* label = active == DemoPreset::EarthTerrain ? "Earth terrain" :
+                            active == DemoPreset::SaturnRing ? "Saturn ring edge" :
+                            active == DemoPreset::Collision ? "Planet collision" : "Choose preset...";
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##demo-presets", label)) {
+            ImGui::SeparatorText("Appearance & AA");
+            if (ImGui::Selectable("Earth terrain", active == DemoPreset::EarthTerrain)) {
+                activate_studio_preset(state, DemoPreset::EarthTerrain);
+            }
+            if (ImGui::Selectable("Saturn ring edge", active == DemoPreset::SaturnRing)) {
+                activate_studio_preset(state, DemoPreset::SaturnRing);
+            }
+            ImGui::SeparatorText("Motion & collisions");
+            if (ImGui::Selectable("Planet collision", active == DemoPreset::Collision)) {
+                activate_studio_preset(state, DemoPreset::Collision);
+            }
+            if (active != DemoPreset::None) {
+                ImGui::Separator();
+                if (ImGui::Selectable("Exit demo")) exit_studio_preset(state);
+            }
+            ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        if (state.demos.active() != DemoPreset::None &&
-            ImGui::Button("Exit demo", ImVec2(-1, 0))) exit_studio_preset(state);
     }
     ImGui::EndDisabled();
     ImGui::EndChild();
@@ -619,11 +711,17 @@ void draw_inspector(StudioState& state, const RenderFrame& frame, float width) {
     }
     if (state.session.project().solar_system && state.design_view) {
         ImGui::Checkbox("Show baseline", &state.compare_baseline);
+        ImGui::SetItemTooltip("Preview this planet's default appearance without undoing your edits.\n"
+                              "Uncheck to return to your design. Unedited planets look identical.");
+        if (state.compare_baseline) ImGui::TextDisabled("Baseline preview - uncheck to edit");
     }
+    const bool was_pixel_tab_active = state.pixel_tab_active;
+    state.pixel_tab_active = false;
     if (ImGui::BeginTabBar("##inspector-tabs")) {
         if (ImGui::BeginTabItem(state.session.project().solar_system ? "Design" : "Appearance")) {
             ImGui::BeginDisabled(state.session.mode() != SessionMode::Design ||
-                                 state.demos.active() == DemoPreset::Collision);
+                                 state.demos.active() == DemoPreset::Collision ||
+                                 (state.design_view && state.compare_baseline));
             if (state.session.project().solar_system) edit_solar_design(state);
             else edit_appearance(state);
             ImGui::EndDisabled();
@@ -638,6 +736,14 @@ void draw_inspector(StudioState& state, const RenderFrame& frame, float width) {
         }
         if (ImGui::BeginTabItem("Pixel", nullptr,
                                 state.select_pixel_tab ? ImGuiTabItemFlags_SetSelected : 0)) {
+            state.pixel_tab_active = true;
+            // Entering Pixel selects the tool its instructions describe. Do this only
+            // on entry, so disabling Inspect or resetting the view remains effective.
+            if (!was_pixel_tab_active && !state.camera_transition && !state.inspect_pixel) {
+                state.inspect_pixel = true;
+                state.selected_pixel_x = state.selected_pixel_y = -1;
+                state.sculpt_stroke.end();
+            }
             draw_pixel_inspector(state, frame);
             ImGui::EndTabItem();
         }
@@ -676,20 +782,29 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
         state.sculpt_stroke.end();
         if (state.compare_modes) {
             state.inspect_pixel = true;
+            state.select_pixel_tab = true;
+            state.selected_pixel_x = std::max(1, state.render.width / 2) / 2;
+            state.selected_pixel_y = state.render.height / 2;
             if (state.session.mode() == SessionMode::Simulate) state.session.set_playing(false);
             if (state.demos.active() == DemoPreset::Collision) state.demos.set_playing(false);
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Inspect", &state.inspect_pixel)) {
-        state.selected_pixel_x = state.selected_pixel_y = -1;
-        state.sculpt_stroke.end();
-        if (!state.inspect_pixel) state.compare_modes = false;
+    if (!state.compare_modes) {
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Inspect", &state.inspect_pixel)) {
+            state.selected_pixel_x = state.selected_pixel_y = -1;
+            state.sculpt_stroke.end();
+            if (state.inspect_pixel) state.select_pixel_tab = true;
+        }
     }
     if (state.compare_modes) {
         sampling_combo("Left", state.compare_left);
         ImGui::SameLine();
         sampling_combo("Right", state.compare_right);
+        if (state.session.mode() == SessionMode::Simulate ||
+            state.demos.active() == DemoPreset::Collision) {
+            ImGui::TextDisabled("Playback paused for comparison");
+        }
     } else {
         for (SamplingMode mode : {SamplingMode::Single, SamplingMode::SSAA4,
                                   SamplingMode::MSAA4}) {
@@ -724,34 +839,50 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
     const int image_width = frame.image.width;
     const int image_height = frame.image.height;
     const ImVec2 available = ImGui::GetContentRegionAvail();
-    const float image_space_height = std::max(100.0f, available.y - 100.0f);
+    const bool show_events = !state.compare_modes &&
+        (state.session.mode() == SessionMode::Simulate || state.demos.active() == DemoPreset::Collision);
+    const float image_space_height = std::max(100.0f, available.y - (show_events ? 100.0f : 0.0f));
     const float fit = std::min(available.x / image_width, image_space_height / image_height);
     const ImVec2 size(image_width * fit, image_height * fit);
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (available.x - size.x) * 0.5f));
     const ImVec2 top_left = ImGui::GetCursorScreenPos();
     ImGui::Image(texture, size, flip_image_y ? ImVec2(0, 1) : ImVec2(0, 0),
                  flip_image_y ? ImVec2(1, 0) : ImVec2(1, 1));
-    if (state.compare_modes) {
+    if (frame.panel_count == 2) {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const float middle = top_left.x + size.x * 0.5f;
         draw->AddLine({middle, top_left.y}, {middle, top_left.y + size.y},
                       IM_COL32(245, 245, 245, 220), 1.0f);
         draw->AddText({top_left.x + 8.0f, top_left.y + 8.0f}, IM_COL32(230, 235, 240, 255),
-                      sampling_name(state.compare_left));
+                      sampling_name(frame.panel_sampling[0]));
         draw->AddText({middle + 8.0f, top_left.y + 8.0f}, IM_COL32(230, 235, 240, 255),
-                      sampling_name(state.compare_right));
+                      sampling_name(frame.panel_sampling[1]));
     }
-    if (state.inspect_pixel && state.selected_pixel_x >= 0 && state.selected_pixel_y >= 0 &&
-        state.selected_pixel_x < image_width && state.selected_pixel_y < image_height) {
-        const ImVec2 point(top_left.x + (state.selected_pixel_x + 0.5f) * size.x / image_width,
-                           top_left.y + (state.selected_pixel_y + 0.5f) * size.y / image_height);
-        ImGui::GetWindowDrawList()->AddRect({point.x - 4, point.y - 4},
-                                            {point.x + 4, point.y + 4},
-                                            IM_COL32(255, 255, 255, 255), 0.0f, 0, 1.5f);
+    if (state.inspect_pixel && frame.trace) {
+        const auto region = studio_pixel_region(frame, frame.trace->x, frame.trace->y,
+                                                  state.pixel_region_size);
+        const int panel_width = image_width / frame.panel_count;
+        for (int panel = 0; panel < frame.panel_count && region.size > 0; ++panel) {
+            const int y = flip_image_y ? image_height - region.y - region.size : region.y;
+            const ImVec2 a(top_left.x + (panel * panel_width + region.x) * fit,
+                            top_left.y + y * fit);
+            ImGui::GetWindowDrawList()->AddRect(a,
+                {a.x + region.size * fit, a.y + region.size * fit},
+                IM_COL32(255, 255, 255, 255), 0.0f, 0, 1.5f);
+        }
     }
     ImGui::SetCursorScreenPos(top_left);
-    ImGui::InvisibleButton("##scene-interaction", size);
-    if (!state.camera_transition && ImGui::IsItemHovered()) {
+    ImGui::InvisibleButton("##scene-interaction", size, ImGuiButtonFlags_EnableNav);
+    // Keyboard focus is useful for pixel nudging, but must not count as mouse hover.
+    const bool mouse_over_scene = ImGui::IsItemHovered(ImGuiHoveredFlags_NoNavOverride);
+    if (state.inspect_pixel && ImGui::IsItemFocused()) {
+        // Keep arrow keys on the sampled pixel instead of navigating to another control.
+        for (ImGuiKey key : {ImGuiKey_LeftArrow, ImGuiKey_RightArrow,
+                             ImGuiKey_UpArrow, ImGuiKey_DownArrow}) {
+            ImGui::SetItemKeyOwner(key);
+        }
+    }
+    if (!state.camera_transition && mouse_over_scene) {
         const float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
             const double minimum_zoom = state.design_view && state.session.project().solar_system
@@ -763,9 +894,11 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
     const bool design_canvas = state.design_view && state.session.project().solar_system &&
                                state.session.mode() == SessionMode::Design;
     const bool sculpting = design_canvas && !state.inspect_pixel && !state.compare_modes &&
+                           !state.pixel_tab_active &&
                            !state.camera_transition;
-    const ImGuiMouseButton rotate_button = design_canvas ? ImGuiMouseButton_Right : ImGuiMouseButton_Left;
-    if (!state.camera_transition && ImGui::IsItemHovered() &&
+    const ImGuiMouseButton rotate_button = design_canvas || state.inspect_pixel || state.pixel_tab_active
+        ? ImGuiMouseButton_Right : ImGuiMouseButton_Left;
+    if (!state.camera_transition && mouse_over_scene &&
         ImGui::IsMouseDragging(rotate_button, 2.0f)) {
         const ImVec2 delta = ImGui::GetIO().MouseDelta;
         state.render.camera.yaw += delta.x * 0.006;
@@ -773,7 +906,7 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
                                                -1.3, 1.3);
     }
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) state.sculpt_stroke.end();
-    if (sculpting && !state.compare_baseline && ImGui::IsItemHovered() &&
+    if (sculpting && !state.compare_baseline && mouse_over_scene &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const ImVec2 mouse = ImGui::GetMousePos();
         const int x = std::clamp(static_cast<int>((mouse.x - top_left.x) / size.x * image_width),
@@ -801,7 +934,7 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
             replace_project(state, std::move(next));
         }
     }
-    if (!state.camera_transition && ImGui::IsItemClicked()) {
+    if (!state.camera_transition && mouse_over_scene && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const ImVec2 mouse = ImGui::GetMousePos();
         const int x = std::clamp(static_cast<int>((mouse.x - top_left.x) / size.x * image_width),
                                  0, image_width - 1);
@@ -812,35 +945,62 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
             state.selected_pixel_x = x;
             state.selected_pixel_y = y;
             state.select_pixel_tab = true;
-        } else {
+        } else if (!state.pixel_tab_active) {
             const int body = frame.body_index[static_cast<std::size_t>(y) * image_width + x];
             if (body >= 0 && !state.design_view) select_studio_scene_body(state, body);
         }
     }
-    ImGui::BeginDisabled(state.camera_transition.has_value());
-    ImGui::SeparatorText("Events");
-    const auto& events = orbit_lab ? state.session.observed_events() : snapshot.events;
-    if (events.empty()) ImGui::TextDisabled("No collisions");
-    std::optional<double> pending_seek;
-    for (auto it = events.rbegin(); it != events.rend(); ++it) {
-        if (orbit_lab) {
-            char label[192]{};
-            std::snprintf(label, sizeof(label), "%.3f   %s + %s", it->time,
-                          it->survivor.c_str(), it->absorbed.c_str());
-            if (ImGui::Selectable(label)) {
-                pending_seek = std::min(100000.0, it->time + 0.05);
-            }
-        } else {
-            ImGui::Text("%.3f   %s + %s", it->time, it->survivor.c_str(),
-                        it->absorbed.c_str());
-        }
+    if (!state.camera_transition && state.inspect_pixel && ImGui::IsItemFocused() &&
+        state.selected_pixel_x >= 0 && state.selected_pixel_y >= 0) {
+        const int panel_width = image_width / frame.panel_count;
+        const int panel = std::min(state.selected_pixel_x / panel_width, frame.panel_count - 1);
+        int x = state.selected_pixel_x % panel_width;
+        int y = state.selected_pixel_y;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) --x;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) ++x;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) y += flip_image_y ? 1 : -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) y += flip_image_y ? -1 : 1;
+        state.selected_pixel_x = panel * panel_width + std::clamp(x, 0, panel_width - 1);
+        state.selected_pixel_y = std::clamp(y, 0, image_height - 1);
     }
-    if (pending_seek) seek_studio_time(state, *pending_seek);
-    ImGui::EndDisabled();
+    if (show_events) {
+        ImGui::BeginDisabled(state.camera_transition.has_value());
+        ImGui::SeparatorText("Events");
+        const auto& events = orbit_lab ? state.session.observed_events() : snapshot.events;
+        if (events.empty()) ImGui::TextDisabled("No collisions");
+        std::optional<double> pending_seek;
+        for (auto it = events.rbegin(); it != events.rend(); ++it) {
+            if (orbit_lab) {
+                char label[192]{};
+                std::snprintf(label, sizeof(label), "%.3f   %s + %s", it->time,
+                              it->survivor.c_str(), it->absorbed.c_str());
+                if (ImGui::Selectable(label)) {
+                    pending_seek = std::min(100000.0, it->time + 0.05);
+                }
+            } else {
+                ImGui::Text("%.3f   %s + %s", it->time, it->survivor.c_str(),
+                            it->absorbed.c_str());
+            }
+        }
+        if (pending_seek) seek_studio_time(state, *pending_seek);
+        ImGui::EndDisabled();
+    }
     ImGui::EndChild();
 }
 
 } // namespace
+
+StudioPixelRegion studio_pixel_region(const RenderFrame& frame, int pixel_x, int pixel_y,
+                                      int cells) {
+    if (frame.panel_count < 1 || frame.panel_count > 2 || frame.image.width <= 0 ||
+        frame.image.height <= 0 || pixel_x < 0 || pixel_x >= frame.image.width ||
+        pixel_y < 0 || pixel_y >= frame.image.height || cells <= 0) return {};
+    const int width = frame.image.width / frame.panel_count;
+    const int size = std::min({cells, width, frame.image.height});
+    if (size <= 0) return {};
+    return {std::clamp(pixel_x % width - size / 2, 0, width - size),
+            std::clamp(pixel_y - size / 2, 0, frame.image.height - size), size};
+}
 
 StudioState::StudioState(Project project, const std::string& project_path)
     : session(std::move(project)) {
@@ -1014,9 +1174,14 @@ void activate_studio_preset(StudioState& state, DemoPreset preset) {
     }
     state.sculpt_stroke.end();
     state.compare_baseline = false;
-    state.compare_modes = false;
-    state.inspect_pixel = false;
+    state.compare_modes = state.compare_modes && preset != DemoPreset::Collision;
+    state.inspect_pixel = state.compare_modes;
     state.selected_pixel_x = state.selected_pixel_y = -1;
+    if (state.compare_modes) {
+        state.selected_pixel_x = std::max(1, state.render.width / 2) / 2;
+        state.selected_pixel_y = state.render.height / 2;
+        state.select_pixel_tab = true;
+    }
     select_body(state, preset == DemoPreset::SaturnRing ? 6 : 3);
     state.render.camera = {};
     if (preset == DemoPreset::Collision) {
@@ -1165,7 +1330,7 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
         ImGui::SameLine();
         if (ImGui::Button("Exit demo")) exit_studio_preset(state);
         ImGui::SameLine();
-        if (ImGui::Button(state.demos.playing() ? "Pause" : "Play")) {
+        if (playback_button(state.demos.playing(), state.compare_modes)) {
             state.demos.set_playing(!state.demos.playing());
         }
         ImGui::SameLine();
@@ -1185,7 +1350,7 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
     } else {
         if (ImGui::Button("Design")) return_studio_design(state);
         ImGui::SameLine();
-        if (ImGui::Button(state.session.playing() ? "Pause" : "Play")) {
+        if (playback_button(state.session.playing(), state.compare_modes)) {
             state.session.set_playing(!state.session.playing());
         }
         ImGui::SameLine();

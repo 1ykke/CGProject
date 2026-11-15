@@ -14,7 +14,7 @@ Image render_preview(const Project& project, const SceneSnapshot& snapshot, int 
 
 RenderFrame render_comparison_scene(const Project& project, const SceneSnapshot& snapshot,
                                     const RenderConfig& config, SamplingMode left,
-                                    SamplingMode right) {
+                                    SamplingMode right, bool right_first) {
     if (config.width <= 0 || config.height <= 0 || config.width > 4096 ||
         static_cast<std::size_t>(config.width) * config.height * 2u > 8000000u ||
         ((config.trace_x != -1 || config.trace_y != -1) &&
@@ -34,8 +34,14 @@ RenderFrame render_comparison_scene(const Project& project, const SceneSnapshot&
         left_config.trace_x = left_config.trace_y = -1;
         right_config.trace_x -= config.width;
     }
-    const RenderFrame left_frame = render_scene(project, snapshot, left_config);
-    const RenderFrame right_frame = render_scene(project, snapshot, right_config);
+    RenderFrame left_frame, right_frame;
+    if (right_first) {
+        right_frame = render_scene(project, snapshot, right_config);
+        left_frame = render_scene(project, snapshot, left_config);
+    } else {
+        left_frame = render_scene(project, snapshot, left_config);
+        right_frame = render_scene(project, snapshot, right_config);
+    }
     RenderFrame combined;
     combined.image.width = config.width * 2;
     combined.image.height = config.height;
@@ -47,6 +53,10 @@ RenderFrame render_comparison_scene(const Project& project, const SceneSnapshot&
     combined.shade_evaluations = left_frame.shade_evaluations + right_frame.shade_evaluations;
     combined.panel_shade_evaluations = {left_frame.shade_evaluations,
                                         right_frame.shade_evaluations};
+    combined.panel_count = 2;
+    combined.panel_sampling = {left, right};
+    combined.panel_render_ms = {left_frame.render_ms, right_frame.render_ms};
+    combined.render_ms = left_frame.render_ms + right_frame.render_ms;
     for (int y = 0; y < config.height; ++y) {
         const std::size_t source = static_cast<std::size_t>(y) * config.width;
         const std::size_t target = static_cast<std::size_t>(y) * combined.image.width;

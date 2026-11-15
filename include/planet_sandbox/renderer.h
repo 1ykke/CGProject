@@ -59,13 +59,18 @@ struct RenderFrame {
     std::optional<PixelTrace> trace;
     std::uint64_t shade_evaluations = 0;
     std::array<std::uint64_t, 2> panel_shade_evaluations{};
+    // CPU render time, excluding pixel-trace extraction, upload, UI and comparison stitching.
+    double render_ms = 0.0;
+    std::array<double, 2> panel_render_ms{};
+    int panel_count = 1;
+    std::array<SamplingMode, 2> panel_sampling{SamplingMode::Single, SamplingMode::Single};
 };
 
 RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
                          const RenderConfig& config);
 RenderFrame render_comparison_scene(const Project& project, const SceneSnapshot& snapshot,
                                     const RenderConfig& config, SamplingMode left,
-                                    SamplingMode right);
+                                    SamplingMode right, bool right_first = false);
 
 Image render_preview(const Project& project, const SceneSnapshot& snapshot, int width, int height);
 void write_ppm(std::ostream& output, const Image& image);
