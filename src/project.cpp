@@ -79,6 +79,14 @@ Project read_project(std::istream& input) {
                 body.design.granule_scale = design.value("granule_scale", body.design.granule_scale);
                 body.design.cloud_motion = design.value("cloud_motion", body.design.cloud_motion);
                 body.design.ring_tilt_offset = design.value("ring_tilt_offset", body.design.ring_tilt_offset);
+                body.design.surface_detail = design.value("surface_detail", body.design.surface_detail);
+                body.design.atmosphere_density = design.value("atmosphere_density", body.design.atmosphere_density);
+                body.design.cloud_altitude = design.value("cloud_altitude", body.design.cloud_altitude);
+                body.design.cloud_shadow = design.value("cloud_shadow", body.design.cloud_shadow);
+                body.design.band_warp = design.value("band_warp", body.design.band_warp);
+                body.design.storm_longitude = design.value("storm_longitude", body.design.storm_longitude);
+                body.design.storm_latitude = design.value("storm_latitude", body.design.storm_latitude);
+                body.design.storm_aspect = design.value("storm_aspect", body.design.storm_aspect);
             }
         }
         if (item.contains("appearance")) {
@@ -137,7 +145,15 @@ void write_project(std::ostream& output, const Project& project) {
                 {"axis_tilt_offset", body.design.axis_tilt_offset},
                 {"granule_scale", body.design.granule_scale},
                 {"cloud_motion", body.design.cloud_motion},
-                {"ring_tilt_offset", body.design.ring_tilt_offset}
+                {"ring_tilt_offset", body.design.ring_tilt_offset},
+                {"surface_detail", body.design.surface_detail},
+                {"atmosphere_density", body.design.atmosphere_density},
+                {"cloud_altitude", body.design.cloud_altitude},
+                {"cloud_shadow", body.design.cloud_shadow},
+                {"band_warp", body.design.band_warp},
+                {"storm_longitude", body.design.storm_longitude},
+                {"storm_latitude", body.design.storm_latitude},
+                {"storm_aspect", body.design.storm_aspect}
             };
             if (!body.design.sculpt_visible.empty()) {
                 item["overrides"]["sculpt_visible"] = body.design.sculpt_visible;
@@ -215,7 +231,15 @@ void validate_project(const Project& project) {
                 !std::isfinite(d.granule_scale) || d.granule_scale < 0.2 || d.granule_scale > 3.0 ||
                 !std::isfinite(d.cloud_motion) || d.cloud_motion < 0.0 || d.cloud_motion > 3.0 ||
                 !std::isfinite(d.ring_tilt_offset) || d.ring_tilt_offset < -30.0 ||
-                d.ring_tilt_offset > 30.0) {
+                d.ring_tilt_offset > 30.0 ||
+                !std::isfinite(d.surface_detail) || d.surface_detail < 0.0 || d.surface_detail > 2.0 ||
+                !std::isfinite(d.atmosphere_density) || d.atmosphere_density < 0.0 || d.atmosphere_density > 2.0 ||
+                !std::isfinite(d.cloud_altitude) || d.cloud_altitude < 0.005 || d.cloud_altitude > 0.06 ||
+                !std::isfinite(d.cloud_shadow) || d.cloud_shadow < 0.0 || d.cloud_shadow > 1.0 ||
+                !std::isfinite(d.band_warp) || d.band_warp < 0.0 || d.band_warp > 1.0 ||
+                !std::isfinite(d.storm_longitude) || d.storm_longitude < 0.0 || d.storm_longitude > 1.0 ||
+                !std::isfinite(d.storm_latitude) || d.storm_latitude < 0.08 || d.storm_latitude > 0.92 ||
+                !std::isfinite(d.storm_aspect) || d.storm_aspect < 0.5 || d.storm_aspect > 2.0) {
                 throw std::invalid_argument("Invalid fixed body identity or design override");
             }
         }

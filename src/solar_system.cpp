@@ -79,6 +79,10 @@ BodyKind parse_body_kind(const std::string& id) {
 DesignOverrides baseline_design(BodyKind kind) {
     DesignOverrides design;
     if (kind == BodyKind::Venus) design.cloud_opacity = 1.0;
+    if (kind == BodyKind::Neptune) {
+        design.storm_longitude = 0.19;
+        design.storm_latitude = 0.16;
+    }
     return design;
 }
 

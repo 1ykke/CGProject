@@ -18,7 +18,7 @@ struct Image {
 };
 
 enum class SamplingMode { Single, SSAA4, MSAA4, SSAA16 };
-enum class TraceSurface { Background, Body, Ring, Cloud, Trail, ReferenceTrail };
+enum class TraceSurface { Background, Body, Ring, Cloud, Trail, ReferenceTrail, Atmosphere };
 
 struct TraceSample {
     Vec2 position;

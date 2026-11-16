@@ -1,5 +1,6 @@
 #include "planet_sandbox/texture.h"
 #include "planet_sandbox/sculpt.h"
+#include "planet_sandbox/planet_visual.h"
 
 #include <algorithm>
 #include <array>
@@ -47,15 +48,6 @@ double jupiter_belt_sample(double v) {
     return profile[row] * (1.0 - (position - row)) + profile[next] * (position - row);
 }
 
-double jupiter_spot_mask(double u, double v, double scale) {
-    if (scale <= 0.0) return 0.0;
-    const double wrapped = std::abs(u - 0.37 - std::round(u - 0.37));
-    const double width = 0.05 * scale;
-    const double height = 0.045 * scale;
-    return std::exp(-0.5 * (std::pow(wrapped / width, 2) +
-                            std::pow((v - 0.61) / height, 2)));
-}
-
 double venus_cloud_radius(double u, double v, const DesignOverrides& design) {
     const double height = solar_height_sample(BodyKind::Venus, u, v);
     return 1.055 + (height - 0.5) * 0.012 * design.relief * polar_fade(v) +
@@ -79,16 +71,19 @@ double solar_shape_multiplier(BodyKind kind, double u, double v,
     if (kind == BodyKind::Venus) {
         return venus_cloud_radius(u, v, design);
     }
-    const double height = solar_height_sample(kind, u, v);
+    const auto source = solar_visual_uv(kind, u, v, design);
+    const double height = solar_height_sample(kind, source.x, source.y);
     double radius = solar_relief_multiplier(kind, height, v, design.relief);
     if (kind == BodyKind::Mercury) {
         radius -= 0.018 * design.crater_depth * mercury_basin_mask(u, v) * polar_fade(v);
     }
     if (kind == BodyKind::Jupiter) {
         radius += 0.012 * design.belt_relief *
-                  (jupiter_belt_sample(v) - 0.5) * polar_fade(v);
-        radius += 0.008 * design.storm_relief *
-                  jupiter_spot_mask(u, v, design.storm_scale) * polar_fade(v);
+                  (jupiter_belt_sample(source.y) - 0.5) * polar_fade(v);
+    }
+    if (kind == BodyKind::Jupiter || kind == BodyKind::Neptune) {
+        radius += 0.008 * design.storm_relief * std::min(1.0, design.storm_scale) *
+                  solar_storm_mask(kind, source.x, source.y) * polar_fade(v);
     }
     return radius + sculpt_offset(design, layer, u, v);
 }

@@ -47,6 +47,14 @@ struct DesignOverrides {
     double granule_scale = 1.0;
     double cloud_motion = 1.0;
     double ring_tilt_offset = 0.0;
+    double surface_detail = 1.0;
+    double atmosphere_density = 1.0;
+    double cloud_altitude = 0.018;
+    double cloud_shadow = 0.65;
+    double band_warp = 0.0;
+    double storm_longitude = 0.37;
+    double storm_latitude = 0.61;
+    double storm_aspect = 1.0;
 };
 
 struct BodySpec {

@@ -1,6 +1,7 @@
 #include "planet_sandbox/renderer.h"
 #include "planet_sandbox/sculpt.h"
 #include "planet_sandbox/texture.h"
+#include "planet_sandbox/planet_visual.h"
 
 #include <algorithm>
 #include <array>
@@ -29,10 +30,11 @@ Vec2 sample_offset(int sample_count, int sample) {
 }
 
 TraceSurface geometry_surface(TraceSurface surface) {
+    if (surface == TraceSurface::Atmosphere) return TraceSurface::Background;
     return surface == TraceSurface::Cloud ? TraceSurface::Body : surface;
 }
 
-struct Vec3 { double x, y, z; };
+using Vec3 = VisualVector;
 struct Color { double r, g, b; };
 struct Vertex { Vec3 position, normal; double u, v; };
 struct ScreenVertex { double x, y, depth, u, v; Vec3 normal, position; };
@@ -134,12 +136,94 @@ struct Material {
     bool venus_surface_pass = false;
     bool venus_cloud_pass = false;
     double time = 0.0;
+    Vec3 center{}, light{-0.4, 0.55, 0.75}, pole{0, 1, 0}, ring_normal{0, .89, -.46};
+    double radius = 1.0, envelope = 1.0, cloud_radius = 1.018;
+    const VisualDetailMap* detail = nullptr;
 };
 
-Color surface_color(const Material& material, double u, double v, Vec3 normal) {
+Vec3 ring_normal_for(BodyKind kind, const DesignOverrides& design) {
+    if (kind == BodyKind::Uranus) {
+        const double tilt = (98.0 + design.axis_tilt_offset) * pi / 180.0;
+        return {-std::sin(tilt) * std::cos(0.35), std::cos(tilt),
+                 std::sin(tilt) * std::sin(0.35)};
+    }
+    const double tilt = std::atan2(0.46, 0.89) - design.ring_tilt_offset * pi / 180.0;
+    return {0.0, std::cos(tilt), -std::sin(tilt)};
+}
+
+double shape_envelope(BodyKind kind, const DesignOverrides& d) {
+    double sculpt = 0.0;
+    for (float value : d.sculpt_visible) sculpt = std::max(sculpt, double(value));
+    switch (kind) {
+    case BodyKind::Sun: return 1 + .012 * d.relief + sculpt;
+    case BodyKind::Mercury: return 1 + .026 * d.relief + sculpt;
+    case BodyKind::Venus: return 1.055 + .006 * d.relief + sculpt;
+    case BodyKind::Earth: return 1 + .012 * d.relief + sculpt;
+    case BodyKind::Mars: return 1 + .0225 * d.relief + sculpt;
+    case BodyKind::Jupiter: return 1 + .009 * d.relief + .006 * d.belt_relief + .008 * d.storm_relief + sculpt;
+    case BodyKind::Saturn: return 1 + .013 * d.relief + sculpt;
+    case BodyKind::Uranus: return 1 + .011 * d.relief + sculpt;
+    case BodyKind::Neptune: return 1 + .015 * d.relief + .008 * d.storm_relief + sculpt;
+    default: return 1;
+    }
+}
+
+double ring_opacity(const Material& m, double radial) {
+    if (radial < 0.0 || radial > 1.0) return 0.0;
+    const double gap = smoothstep(m.design->cassini_gap * .008,
+                                  m.design->cassini_gap * .013 + .001, std::abs(radial - .68));
+    return sample_texture(*m.ring_map, radial, 0.5, false)[3] * gap *
+           std::clamp(m.design->ring_width, 0.0, 1.0);
+}
+
+double cloud_mask(const Material& m, double u, double v) {
+    const auto cloud = sample_texture(*m.cloud_map, u + m.design->cloud_motion * m.time * .006, v);
+    return (cloud[0] + cloud[1] + cloud[2]) / 3.0;
+}
+
+double cloud_transmission(const Material& m, Vec3 world) {
+    if (!m.cloud_map || m.design->cloud_opacity == 0 || m.design->cloud_shadow == 0) return 1.0;
+    const Vec3 p = (world - m.center) * (1.0 / m.radius);
+    const double b = dot(p, m.light);
+    const double t = -b + std::sqrt(std::max(0.0, b * b + m.cloud_radius * m.cloud_radius - dot(p, p)));
+    const Vec3 hit = normalize(p + m.light * t);
+    const double spin = m.time * .45;
+    const double u = std::atan2(hit.x * std::sin(spin) + hit.z * std::cos(spin),
+                               hit.x * std::cos(spin) - hit.z * std::sin(spin)) / (2 * pi);
+    const double v = std::acos(std::clamp(hit.y, -1.0, 1.0)) / pi;
+    const double mask = (cloud_mask(m, u, v) * 2 + cloud_mask(m, u + .0015, v) +
+                         cloud_mask(m, u - .0015, v)) * .25;
+    return 1.0 - m.design->cloud_shadow * m.design->cloud_opacity * mask * .82;
+}
+
+Vec3 detailed_normal(const Material& m, double u, double v, Vec2 source, Vec3 normal, Vec3 world) {
+    if (!m.detail || m.design->surface_detail == 0) return normal;
+    Vec2 slope = sample_visual_detail(*m.detail, source.x, source.y);
+    const auto& d = *m.design;
+    if (m.kind == BodyKind::Jupiter || m.kind == BodyKind::Saturn ||
+        m.kind == BodyKind::Uranus || m.kind == BodyKind::Neptune) {
+        constexpr double h = 0.0002;
+        const auto a = solar_visual_uv(m.kind, u - h, v, d), b = solar_visual_uv(m.kind, u + h, v, d);
+        const auto c = solar_visual_uv(m.kind, u, v - h, d), e = solar_visual_uv(m.kind, u, v + h, d);
+        slope = {(slope.x * std::remainder(b.x - a.x, 1.0) + slope.y * (b.y - a.y)) / (2 * h),
+                 (slope.x * std::remainder(e.x - c.x, 1.0) + slope.y * (e.y - c.y)) / (2 * h)};
+    }
+    const Vec3 radial = normalize(world - m.center);
+    const double latitude = std::sin(pi * v);
+    const double fade = smoothstep(0.0, 0.15, latitude);
+    double amplitude = m.kind == BodyKind::Earth ? .012 : m.kind == BodyKind::Mars ? .045 :
+                       m.kind == BodyKind::Mercury ? .035 : .012;
+    amplitude *= d.surface_detail * (m.venus_surface_pass ? d.radar_relief : d.relief) * fade;
+    const double du = std::clamp(slope.x * amplitude / (2 * pi * std::max(.12, latitude)), -.65, .65);
+    const double dv = std::clamp(slope.y * amplitude / pi, -.65, .65);
+    return perturb_visual_normal(normal, radial, m.pole, du, dv);
+}
+
+Color surface_color(const Material& material, double u, double v, Vec3 normal, Vec3 world, Vec3 view) {
     const auto& a = material.appearance;
     if (material.color_map) {
-        const auto texel = sample_texture(*material.color_map, u, v);
+        const auto source = solar_visual_uv(material.kind, u, v, *material.design);
+        const auto texel = sample_texture(*material.color_map, source.x, source.y);
         Color color{std::pow(texel[0], 2.2), std::pow(texel[1], 2.2),
                     std::pow(texel[2], 2.2)};
         const DesignOverrides& design = *material.design;
@@ -159,19 +243,15 @@ Color surface_color(const Material& material, double u, double v, Vec3 normal) {
             material.kind == BodyKind::Uranus || material.kind == BodyKind::Neptune) {
             color = mix({0.34, 0.32, 0.30}, color, design.band_contrast);
         }
-        const double wrap_distance = std::min(std::abs(u - 0.37), 1.0 - std::abs(u - 0.37));
         if (material.kind == BodyKind::Jupiter) {
-            const double spot = std::exp(-0.5 * (std::pow(wrap_distance / 0.05, 2) +
-                                                 std::pow((v - 0.61) / 0.045, 2)));
+            const double spot = solar_storm_mask(material.kind, source.x, source.y);
             const Color target = design.storm_scale < 1.0 ? Color{0.42, 0.35, 0.27} :
                                                             Color{0.67, 0.26, 0.095};
             color = mix(color, target,
                         std::clamp(std::abs(design.storm_scale - 1.0) * spot * 0.50, 0.0, 0.8));
         }
         if (material.kind == BodyKind::Neptune) {
-            const double du = std::min(std::abs(u - 0.19), 1.0 - std::abs(u - 0.19));
-            const double storm = std::exp(-0.5 * (std::pow(du / 0.075, 2) +
-                                                  std::pow((v - 0.16) / 0.055, 2)));
+            const double storm = solar_storm_mask(material.kind, source.x, source.y);
             const Color target = design.storm_scale < 1.0 ? Color{0.09, 0.16, 0.45} :
                                                             Color{0.025, 0.035, 0.16};
             color = mix(color, target,
@@ -190,9 +270,26 @@ Color surface_color(const Material& material, double u, double v, Vec3 normal) {
             color = mix(color, {0.82, 0.88, 0.91},
                         design.ice_extent * smoothstep(0.72, 0.96, polar));
         }
-        const Vec3 light = normalize({-0.4, 0.55, 0.75});
-        const double diffuse = std::max(0.0, dot(normal, light));
-        return scale(color, material.emissive ? 0.90 + 0.10 * diffuse : 0.24 + 0.76 * diffuse);
+        if (material.emissive) return scale(color, .94 + .06 * std::max(0.0, dot(normal, material.light)));
+        normal = detailed_normal(material, u, v, source, normal, world);
+        const double diffuse = std::max(0.0, dot(normal, material.light));
+        double transmission = cloud_transmission(material, world);
+        if (material.kind == BodyKind::Saturn && material.ring_map) {
+            const double distance = ring_plane_radius((world - material.center) * (1.0 / material.radius),
+                                                       material.light, material.ring_normal);
+            if (distance >= 1.18 && distance <= 2.43)
+                transmission *= 1.0 - .90 * ring_opacity(material, (distance - 1.18) / 1.25);
+        }
+        Color lit = scale(color, .025 + .975 * diffuse * transmission);
+        if (material.kind == BodyKind::Earth) {
+            const double ocean = smoothstep(texel[0] * 1.25, texel[0] * 1.25 + .12, texel[2]) *
+                                 (1 - smoothstep(.18, .42, texel[1]));
+            const Vec3 half = normalize(view + material.light);
+            const double fresnel = .025 + .32 * std::pow(1 - std::max(0.0, dot(normal, view)), 5);
+            const double specular = std::pow(std::max(0.0, dot(normal, half)), 100) * ocean * fresnel * 3 * transmission;
+            lit.r += specular * .92; lit.g += specular * .96; lit.b += specular;
+        }
+        return lit;
     }
     const double latitude = 0.5 - v;
     const double terrain = noise(u * 12.0 + 20.0, v * 12.0 + 20.0, a.seed);
@@ -218,28 +315,35 @@ struct Fragment {
     FragmentBlend blend = FragmentBlend::Opaque;
 };
 
-Fragment shade_fragment(const Material& material, double u, double v, Vec3 normal, bool ring) {
+Fragment shade_fragment(const Material& material, double u, double v, Vec3 normal, Vec3 world, Vec3 view, bool ring) {
     if (material.venus_cloud_pass) {
-        return {surface_color(material, u, v, normal), material.design->cloud_opacity,
-                FragmentBlend::Cloud};
+        Color color = surface_color(material, u, v, normal, world, view);
+        const double rim = std::pow(1 - std::max(0.0, dot(normal, view)), 3) *
+                           smoothstep(-.12, .25, dot(normal, material.light)) *
+                           material.design->atmosphere_density * .18;
+        // Venus's visible deck is its atmosphere; composite its opacity only once.
+        color = mix(color, {.48, .35, .15}, std::clamp(rim, 0.0, .36));
+        return {color, material.design->cloud_opacity, FragmentBlend::Cloud};
     }
     if (material.cloud_pass) {
-        const auto cloud = sample_texture(*material.cloud_map,
-                                          u + material.design->cloud_motion * material.time * 0.006, v);
-        const double mask = (cloud[0] + cloud[1] + cloud[2]) / 3.0;
-        const double alpha = material.design->cloud_opacity * mask * 0.9;
-        return {{0.78, 0.85, 0.92}, alpha < 0.01 ? 0.0 : alpha, FragmentBlend::Cloud};
+        const double mask = cloud_mask(material, u, v);
+        const double du = cloud_mask(material, u + .0015, v) - cloud_mask(material, u - .0015, v);
+        const double dv = cloud_mask(material, u, v + .003) - cloud_mask(material, u, v - .003);
+        const Vec3 cloud_normal = perturb_visual_normal(normal, normal, material.pole, du * .7, dv * .7);
+        const double diffuse = std::max(0.0, dot(cloud_normal, material.light));
+        const double alpha = 1 - std::exp(-material.design->cloud_opacity * mask * 2.0 /
+                                           std::max(.35, dot(normal, view)));
+        const double brightness = .025 + .975 * diffuse;
+        return {scale({.93, .96, 1.0}, brightness), alpha < .005 ? 0.0 : alpha, FragmentBlend::Cloud};
     }
     if (ring && material.ring_map) {
         const auto texel = sample_texture(*material.ring_map, u, v, false);
-        const double gap_distance = std::abs(u - 0.68);
-        const double gap = smoothstep(material.design->cassini_gap * 0.008,
-                                      material.design->cassini_gap * 0.013 + 0.001,
-                                      gap_distance);
-        const double alpha = texel[3] * gap *
-                             std::clamp(material.design->ring_width, 0.0, 1.0);
-        return {{std::pow(texel[0], 2.2), std::pow(texel[1], 2.2),
-                 std::pow(texel[2], 2.2)}, alpha < 0.03 ? 0.0 : alpha,
+        const double alpha = ring_opacity(material, u);
+        const Vec3 relative = (world - material.center) * (1.0 / material.radius);
+        const double visibility = planet_blocks_light(relative, material.light, 1.0) ? .025 : 1.0;
+        const double light = .06 + .94 * std::sqrt(std::abs(dot(normal, material.light))) * visibility;
+        return {scale({std::pow(texel[0], 2.2), std::pow(texel[1], 2.2),
+                 std::pow(texel[2], 2.2)}, light), alpha < 0.03 ? 0.0 : alpha,
                 FragmentBlend::Alpha};
     }
     if (ring && material.kind == BodyKind::Uranus) {
@@ -249,7 +353,7 @@ Fragment shade_fragment(const Material& material, double u, double v, Vec3 norma
     }
     const double stripe = 0.5 + 0.5 * std::sin(u * 26.0 * pi);
     return {ring ? scale(mix(material.secondary, material.primary, stripe), 0.72)
-                 : surface_color(material, u, v, normal), 1.0, FragmentBlend::Opaque};
+                 : surface_color(material, u, v, normal, world, view), 1.0, FragmentBlend::Opaque};
 }
 
 class Rasterizer {
@@ -390,14 +494,15 @@ private:
                     const Vec3 normal = normalize({interpolate(p[0].normal.x, p[1].normal.x, p[2].normal.x),
                                                    interpolate(p[0].normal.y, p[1].normal.y, p[2].normal.y),
                                                    interpolate(p[0].normal.z, p[1].normal.z, p[2].normal.z)});
+                    const Vec3 world{interpolate(p[0].position.x, p[1].position.x, p[2].position.x),
+                                     interpolate(p[0].position.y, p[1].position.y, p[2].position.y),
+                                     interpolate(p[0].position.z, p[1].position.z, p[2].position.z)};
                     if (material.cloud_pass || material.venus_cloud_pass) {
-                        const Vec3 world{interpolate(p[0].position.x, p[1].position.x, p[2].position.x),
-                                         interpolate(p[0].position.y, p[1].position.y, p[2].position.y),
-                                         interpolate(p[0].position.z, p[1].position.z, p[2].position.z)};
                         if (dot(normal, camera_position_ - world) <= 0.0) continue;
                     }
                     if (!cached || config_.sampling != SamplingMode::MSAA4) {
-                        cached_fragment = shade_fragment(material, u, v, normal, ring);
+                        cached_fragment = shade_fragment(material, u, v, normal, world,
+                                                          normalize(camera_position_ - world), ring);
                         ++shade_evaluations_;
                         cached = true;
                     }
@@ -486,6 +591,75 @@ public:
                         sample.surface = surface;
                     }
                 }
+            }
+        }
+    }
+
+    void atmosphere(const Material& m) {
+        if (!m.design || m.design->atmosphere_density <= 0 || m.kind == BodyKind::Mercury ||
+            m.kind == BodyKind::Sun || m.kind == BodyKind::Custom || m.kind == BodyKind::Venus) return;
+        const double scale_height = m.kind == BodyKind::Mars ? .004 : m.kind == BodyKind::Earth ? .008 : .006;
+        const double outer = m.radius * (std::max(m.envelope,
+            m.kind == BodyKind::Earth ? m.cloud_radius : m.envelope) + .018);
+        ScreenVertex projected{};
+        const double center_depth = camera_depth(m.center);
+        if (center_depth + outer < near_plane) return;
+        int x0 = 0, y0 = 0, x1 = config_.width - 1, y1 = config_.height - 1;
+        if (center_depth > outer + near_plane && project(m.center, projected)) {
+            const double size = image_scale_ * outer / (center_depth - outer);
+            if (projected.x + size < 0 || projected.x - size >= config_.width ||
+                projected.y + size < 0 || projected.y - size >= config_.height) return;
+            x0 = int(std::clamp(std::floor(projected.x - size), 0.0, double(x1)));
+            x1 = int(std::clamp(std::ceil(projected.x + size), 0.0, double(x1)));
+            y0 = int(std::clamp(std::floor(projected.y - size), 0.0, double(y1)));
+            y1 = int(std::clamp(std::ceil(projected.y + size), 0.0, double(y1)));
+        }
+        const Vec3 offset = camera_position_ - m.center;
+        const double c = dot(offset, offset) - outer * outer;
+        const Color daylight = m.kind == BodyKind::Mars ? Color{.40, .19, .07} :
+                               m.kind == BodyKind::Venus ? Color{.48, .35, .15} :
+                               m.kind == BodyKind::Earth ? Color{.10, .32, .72} :
+                               m.kind == BodyKind::Jupiter || m.kind == BodyKind::Saturn ? Color{.32, .28, .20} :
+                               Color{.12, .30, .48};
+        for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
+            double cached_alpha = 0.0; Color cached_color{}; bool cached = false;
+            for (int s = 0; s < sample_count_; ++s) {
+                const Vec2 sub = sample_offset(sample_count_, s);
+                const Vec3 ray = normalize(view_direction_ * -1.0 +
+                    right_ * ((x + sub.x - config_.width * .5) / image_scale_) +
+                    up_ * ((config_.height * .5 - y - sub.y) / image_scale_));
+                const double b = dot(offset, ray), discriminant = b * b - c;
+                if (discriminant <= 0) continue;
+                const double root = std::sqrt(discriminant);
+                const double forward = -dot(ray, view_direction_);
+                const double entry = std::max(near_plane / forward, -b - root);
+                Sample& sample = samples_[(static_cast<std::size_t>(y) * config_.width + x) * sample_count_ + s];
+                const double exit = std::min(-b + root, sample.depth / forward);
+                if (exit <= entry) continue;
+                if (!cached || config_.sampling != SamplingMode::MSAA4) {
+                    double column = 0, illumination = 0;
+                    // Four short steps approximate a thin exponential scattering layer.
+                    for (int step = 0; step < 4; ++step) {
+                        const Vec3 p = offset + ray * (entry + (exit - entry) * (step + .5) / 4);
+                        const double r = std::sqrt(dot(p, p));
+                        const double altitude = std::max(0.0, r / m.radius - 1.0);
+                        const double density = std::exp(-altitude / scale_height) *
+                            smoothstep(0.0, m.radius * .004, outer - r);
+                        column += density;
+                        illumination += density * smoothstep(-.12, .25, dot(p * (1 / r), m.light));
+                    }
+                    const double sun = column > 0 ? illumination / column : 0;
+                    const double phase = .75 * (1 + std::pow(dot(ray, m.light), 2));
+                    const double depth = column * (exit - entry) / (4 * m.radius) * m.design->atmosphere_density *
+                                         (m.kind == BodyKind::Venus ? m.design->cloud_opacity : 1.0);
+                    cached_alpha = std::min(.32, 1 - std::exp(-depth * 1.6)) * sun;
+                    cached_color = scale(daylight, .8 + .2 * phase);
+                    ++shade_evaluations_; cached = true;
+                }
+                if (cached_alpha <= 0.00001) continue;
+                sample.color = mix(sample.color, cached_color, cached_alpha);
+                // Scattering contributes color but cannot hide or select geometry.
+                if (sample.surface == TraceSurface::Background) sample.surface = TraceSurface::Atmosphere;
             }
         }
     }
@@ -600,10 +774,7 @@ void draw_sphere(Rasterizer& rasterizer, const BodyState& body, const Material& 
                                                   SolarShapeLayer::Visible);
             }
             if (material.cloud_pass) {
-                relief *= 1.018;
-                relief += sculpt_offset(*material.design, SolarShapeLayer::Visible,
-                                        static_cast<double>(col) / longitude_steps,
-                                        static_cast<double>(row) / latitude_steps);
+                relief = material.cloud_radius;
             }
             grid[row * (longitude_steps + 1) + col] =
                 {center + normal * (radius * relief), normal,
@@ -645,7 +816,6 @@ void draw_ring(Rasterizer& rasterizer, const BodyState& body, const Material& ma
     const double inner = radius * (material.kind == BodyKind::Uranus ? 1.32 : 1.18);
     const double outer = inner + radius * (material.kind == BodyKind::Uranus ? 0.12 :
                                            material.ring_map ? 1.25 : ring_width);
-    const double ring_tilt = material.ring_map ? material.design->ring_tilt_offset * pi / 180.0 : 0.0;
     const Vec3 center{body.position.x, body.position.y, 0.0};
     const auto vertex = [&](double angle, double distance, double radial) {
         if (material.kind == BodyKind::Uranus) {
@@ -656,14 +826,12 @@ void draw_ring(Rasterizer& rasterizer, const BodyState& body, const Material& ma
             return Vertex{center + Vec3{tipped.x * std::cos(0.35) + tipped.z * std::sin(0.35),
                                         tipped.y,
                                         -tipped.x * std::sin(0.35) + tipped.z * std::cos(0.35)},
-                          {-std::sin(tilt), std::cos(tilt), 0.0}, radial, angle / (2.0 * pi)};
+                          material.ring_normal, radial, angle / (2.0 * pi)};
         }
         return Vertex{center + Vec3{std::cos(angle) * distance,
-                                    std::sin(angle) * distance * (0.46 * std::cos(ring_tilt) -
-                                                                  0.89 * std::sin(ring_tilt)),
-                                    std::sin(angle) * distance * (0.46 * std::sin(ring_tilt) +
-                                                                  0.89 * std::cos(ring_tilt))},
-                      {0.0, 0.89, -0.46}, radial, angle / (2.0 * pi)};
+                                    std::sin(angle) * distance * -material.ring_normal.z,
+                                    std::sin(angle) * distance * material.ring_normal.y},
+                      material.ring_normal, radial, angle / (2.0 * pi)};
     };
     for (int segment = 0; segment < segments; ++segment) {
         const double a = 2.0 * pi * segment / segments;
@@ -698,6 +866,28 @@ RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
         throw std::invalid_argument("Render size or camera distance is too large");
     }
     Rasterizer rasterizer(project, config);
+    const auto sun = std::find_if(snapshot.bodies.begin(), snapshot.bodies.end(),
+                                  [](const BodyState& b) { return b.id == "sun"; });
+    const auto configure = [&](Material& m, const BodyState& body, double scale_factor, bool detail) {
+        m.center = {body.position.x, body.position.y, 0};
+        m.radius = body.radius * scale_factor;
+        m.time = snapshot.time;
+        m.light = project.solar_system && sun != snapshot.bodies.end() && body.id != "sun"
+            ? normalize(Vec3{sun->position.x, sun->position.y, 0} - m.center)
+            : normalize(Vec3{-.48, .62, .62});
+        if (!m.design) return;
+        m.ring_normal = ring_normal_for(m.kind, *m.design);
+        if (m.kind == BodyKind::Uranus) m.pole = m.ring_normal;
+        m.envelope = shape_envelope(m.kind, *m.design);
+        m.cloud_radius = m.envelope + m.design->cloud_altitude;
+        if (m.kind == BodyKind::Earth) m.cloud_map = &solar_texture(m.kind, AssetLayer::Clouds);
+        const double projected_radius = config.height * m.radius /
+            (2 * half_fov_tangent * std::max(near_plane, rasterizer.camera_depth(m.center) - m.radius));
+        if (detail && projected_radius >= 20 && m.kind != BodyKind::Sun && m.design->surface_detail > 0) {
+            m.detail = &solar_detail_map(m.kind, m.venus_surface_pass ? SolarShapeLayer::VenusRadar :
+                                                                 SolarShapeLayer::Visible);
+        }
+    };
     struct CloudDraw {
         const BodyState* body;
         const BodySpec* spec;
@@ -714,6 +904,7 @@ RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
     };
     std::vector<CloudDraw> clouds;
     std::vector<RingDraw> rings;
+    std::vector<CloudDraw> atmospheres;
     for (const auto& body : snapshot.bodies) {
         const auto found = std::find_if(project.bodies.begin(), project.bodies.end(),
                                         [&](const BodySpec& item) { return item.id == body.id; });
@@ -737,11 +928,13 @@ RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
             }
             scale_factor = found->display_radius * project.display_scale / found->radius;
         }
+        configure(material, body, scale_factor, true);
         draw_sphere(rasterizer, body, material, index, scale_factor, snapshot.time);
         const double view_position = body.position.x * std::sin(config.camera.yaw) *
                                          std::cos(config.camera.pitch) +
                                      body.position.y * std::sin(config.camera.pitch);
         rings.push_back({&body, &*found, index, scale_factor, view_position});
+        if (project.solar_system) atmospheres.push_back({&body, &*found, index, scale_factor, view_position});
         if (project.solar_system && found->design.cloud_opacity > 0.0 &&
             (found->kind == BodyKind::Venus || found->kind == BodyKind::Earth)) {
             clouds.push_back({&body, &*found, index, scale_factor, view_position});
@@ -779,6 +972,7 @@ RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
                 material.ring_map = &solar_texture(spec.kind, AssetLayer::Ring);
             }
         }
+        configure(material, *ring.body, ring.scale_factor, false);
         draw_ring(rasterizer, *ring.body, material, ring.index, ring.scale_factor);
     }
     std::stable_sort(clouds.begin(), clouds.end(),
@@ -798,9 +992,19 @@ RenderFrame render_scene(const Project& project, const SceneSnapshot& snapshot,
             material.cloud_pass = true;
             material.cloud_map = &solar_texture(spec.kind, AssetLayer::Clouds);
         }
+        configure(material, *cloud.body, cloud.scale_factor, spec.kind == BodyKind::Venus);
         rasterizer.begin_cloud_layer();
         draw_sphere(rasterizer, *cloud.body, material, cloud.index,
                     cloud.scale_factor, snapshot.time);
+    }
+    std::stable_sort(atmospheres.begin(), atmospheres.end(),
+                     [](const CloudDraw& a, const CloudDraw& b) { return a.view_position < b.view_position; });
+    for (const auto& atmosphere : atmospheres) {
+        const auto& spec = *atmosphere.spec;
+        Material material{spec.appearance, {}, {}, false};
+        material.kind = spec.kind; material.design = &spec.design;
+        configure(material, *atmosphere.body, atmosphere.scale_factor, false);
+        rasterizer.atmosphere(material);
     }
     RenderFrame frame = rasterizer.resolve();
     frame.render_ms = std::chrono::duration<double, std::milli>(

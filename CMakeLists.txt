@@ -52,6 +52,7 @@ add_library(planet_core
     src/solar_system.cpp
     src/texture.cpp
     src/solar_shape.cpp
+    src/planet_visual.cpp
     src/sculpt.cpp
     src/simulation.cpp
     src/demo_presets.cpp
@@ -83,6 +84,14 @@ else()
     target_compile_options(planet_core_tests PRIVATE -UNDEBUG)
 endif()
 add_test(NAME planet_core_tests COMMAND planet_core_tests)
+add_executable(planet_visual_tests tests/planet_visual_tests.cpp)
+target_link_libraries(planet_visual_tests PRIVATE planet_core)
+if(MSVC)
+    target_compile_options(planet_visual_tests PRIVATE /UNDEBUG)
+else()
+    target_compile_options(planet_visual_tests PRIVATE -UNDEBUG)
+endif()
+add_test(NAME planet_visual_tests COMMAND planet_visual_tests)
 add_test(NAME planet_aa_benchmark_smoke
     COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:planet_aa_benchmark>
             -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}

@@ -149,6 +149,7 @@ const char* trace_surface_name(TraceSurface surface) {
     case TraceSurface::Body: return "Surface";
     case TraceSurface::Ring: return "Ring";
     case TraceSurface::Cloud: return "Cloud";
+    case TraceSurface::Atmosphere: return "Atmosphere";
     case TraceSurface::Trail: return "Trail";
     case TraceSurface::ReferenceTrail: return "Reference orbit";
     }
@@ -451,7 +452,7 @@ void edit_solar_design(StudioState& state) {
                [](DesignOverrides& d, float v) { d.belt_relief = v; });
         slider("Band contrast", current.band_contrast, 0.0f, 3.0f,
                [](DesignOverrides& d, float v) { d.band_contrast = v; });
-        slider("Great Red Spot", current.storm_scale, 0.0f, 3.0f,
+        slider("Great Red Spot size", current.storm_scale, 0.0f, 3.0f,
                [](DesignOverrides& d, float v) { d.storm_scale = v; });
         slider("Spot relief", current.storm_relief, 0.0f, 3.0f,
                [](DesignOverrides& d, float v) { d.storm_relief = v; });
@@ -479,11 +480,44 @@ void edit_solar_design(StudioState& state) {
                [](DesignOverrides& d, float v) { d.color_shift = v; });
         slider("Cloud contrast", current.band_contrast, 0.0f, 3.0f,
                [](DesignOverrides& d, float v) { d.band_contrast = v; });
-        slider("Storm intensity", current.storm_scale, 0.0f, 3.0f,
+        slider("Storm size", current.storm_scale, 0.0f, 3.0f,
                [](DesignOverrides& d, float v) { d.storm_scale = v; });
         break;
     default:
         break;
+    }
+    if (kind != BodyKind::Sun && ImGui::CollapsingHeader("Light and atmosphere")) {
+        slider("Fine surface detail", current.surface_detail, 0.0f, 2.0f,
+               [](DesignOverrides& d, float v) { d.surface_detail = v; });
+        if (kind != BodyKind::Mercury) {
+            slider("Atmosphere density", current.atmosphere_density, 0.0f, 2.0f,
+                   [](DesignOverrides& d, float v) { d.atmosphere_density = v; });
+        }
+        if (kind == BodyKind::Earth) {
+            slider("Cloud altitude", current.cloud_altitude, 0.005f, 0.06f,
+                   [](DesignOverrides& d, float v) { d.cloud_altitude = std::clamp(double(v), 0.005, 0.06); });
+            slider("Cloud shadow", current.cloud_shadow, 0.0f, 1.0f,
+                   [](DesignOverrides& d, float v) { d.cloud_shadow = v; });
+        }
+        ImGui::TextWrapped("Sunlight follows the Sun in simulation. Close-ups use photographic lighting.");
+    }
+    if ((kind == BodyKind::Jupiter || kind == BodyKind::Saturn || kind == BodyKind::Uranus ||
+         kind == BodyKind::Neptune) && ImGui::CollapsingHeader("Cloud flow and storms")) {
+        slider("Cloud-band warp", current.band_warp, 0.0f, 1.0f,
+               [](DesignOverrides& d, float v) { d.band_warp = v; });
+        if (kind == BodyKind::Jupiter || kind == BodyKind::Neptune) {
+            slider("Storm longitude (degrees)", current.storm_longitude * 360.0, 0.0f, 360.0f,
+                   [](DesignOverrides& d, float v) { d.storm_longitude = v / 360.0; });
+            slider("Storm latitude (north positive)", 90.0 - current.storm_latitude * 180.0, -75.6f, 75.6f,
+                   [](DesignOverrides& d, float v) { d.storm_latitude = std::clamp((90.0 - v) / 180.0, 0.08, 0.92); });
+            slider("Storm aspect", current.storm_aspect, 0.5f, 2.0f,
+                   [](DesignOverrides& d, float v) { d.storm_aspect = v; });
+            if (kind == BodyKind::Neptune) {
+                slider("Storm relief", current.storm_relief, 0.0f, 3.0f,
+                       [](DesignOverrides& d, float v) { d.storm_relief = v; });
+            }
+            ImGui::TextWrapped("Moves the existing storm and surrounding cloud bands together.");
+        }
     }
     if (state.design_view && ImGui::CollapsingHeader("Sculpt brush", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::RadioButton("Raise", state.sculpt_mode == SculptMode::Raise)) {
