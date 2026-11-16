@@ -485,8 +485,7 @@ void edit_solar_design(StudioState& state) {
     default:
         break;
     }
-    if (state.design_view) {
-        ImGui::SeparatorText("Sculpt");
+    if (state.design_view && ImGui::CollapsingHeader("Sculpt brush", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::RadioButton("Raise", state.sculpt_mode == SculptMode::Raise)) {
             state.sculpt_mode = SculptMode::Raise;
         }
@@ -510,6 +509,7 @@ void edit_solar_design(StudioState& state) {
         }
         ImGui::SliderFloat("Brush size", &state.sculpt_radius, 0.12f, 0.8f);
         ImGui::SliderFloat("Strength", &state.sculpt_strength, 0.1f, 1.0f);
+        ImGui::TextWrapped("Paint with the left mouse button. Rotate with the right. Ctrl/Cmd+Z undoes a stroke.");
     }
     if (ImGui::Button("Reset this body", ImVec2(-1, 0))) {
         try {
@@ -560,13 +560,18 @@ void edit_motion(StudioState& state) {
 void draw_sidebar(StudioState& state, float width) {
     ImGui::BeginChild("##sidebar", ImVec2(width, 0), ImGuiChildFlags_Borders);
     ImGui::BeginDisabled(state.camera_transition.has_value());
-    ImGui::TextUnformatted(state.session.project().solar_system ? "SOLAR SYSTEM" : "BODIES");
+    ImGui::TextUnformatted(state.session.project().solar_system ? "CHOOSE A PLANET" : "BODIES");
     ImGui::Separator();
     for (std::size_t i = 0; i < state.session.project().bodies.size(); ++i) {
         const auto& body = state.session.project().bodies[i];
-        if (ImGui::Selectable((body.name + "##" + body.id).c_str(), state.selected == static_cast<int>(i))) {
+        const bool selected = state.selected == static_cast<int>(i);
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Header, {0.12f, 0.36f, 0.37f, 1.0f});
+        if (ImGui::Selectable((body.name + "##" + body.id).c_str(), selected)) {
             select_studio_body(state, static_cast<int>(i));
         }
+        ImGui::SetItemTooltip("%s %s", state.session.mode() == SessionMode::Design &&
+            state.demos.active() != DemoPreset::Collision ? "Design" : "Select", body.name.c_str());
+        if (selected) ImGui::PopStyleColor();
     }
     const bool can_edit = state.session.mode() == SessionMode::Design &&
                           state.demos.active() != DemoPreset::Collision;
@@ -674,13 +679,111 @@ void draw_sidebar(StudioState& state, float width) {
     ImGui::EndChild();
 }
 
+std::string body_name(const Project& project, const std::string& id) {
+    const auto found = std::find_if(project.bodies.begin(), project.bodies.end(),
+                                   [&](const auto& body) { return body.id == id; });
+    return found == project.bodies.end() ? id : found->name;
+}
+
+void draw_initial_motion(const BodySpec& body) {
+    ImGui::TextWrapped("Initial conditions used to start this run. Return to Design to change them.");
+    ImGui::SeparatorText("Initial state");
+    ImGui::Text("Mass: %.8g", body.mass);
+    ImGui::Text("Collision radius: %.8g", body.radius);
+    ImGui::Text("Position: %.3f, %.3f", body.position.x, body.position.y);
+    ImGui::Text("Velocity: %.3f, %.3f", body.velocity.x, body.velocity.y);
+    ImGui::TextDisabled("Values use simulation units.");
+}
+
+void draw_simulation_inspector(StudioState& state) {
+    const auto snapshot = state.demos.snapshot(state.session.snapshot());
+    const auto& project = state.session.project();
+    const auto& selected = project.bodies[state.selected];
+    const bool collision_demo = state.demos.active() == DemoPreset::Collision;
+    ImGui::SeparatorText(collision_demo ? "Demo orbit" : "Live orbit");
+    ImGui::Text("t = %.3f   /   %zu active bodies", snapshot.time, snapshot.bodies.size());
+    const auto live = std::find_if(snapshot.bodies.begin(), snapshot.bodies.end(),
+                                  [&](const auto& body) { return body.id == selected.id; });
+    if (live != snapshot.bodies.end()) {
+        ImGui::Text("Position: %.3f, %.3f", live->position.x, live->position.y);
+        ImGui::Text("Speed: %.4f", std::hypot(live->velocity.x, live->velocity.y));
+        const auto sun = std::find_if(snapshot.bodies.begin(), snapshot.bodies.end(),
+                                      [](const auto& body) { return body.id == "sun"; });
+        if (sun != snapshot.bodies.end() && sun != live) {
+            ImGui::Text("Distance to Sun: %.4f", std::hypot(live->position.x - sun->position.x,
+                                                           live->position.y - sun->position.y));
+        }
+    } else {
+        const auto impact = std::find_if(snapshot.events.rbegin(), snapshot.events.rend(),
+                                        [&](const auto& event) { return event.absorbed == selected.id; });
+        if (impact != snapshot.events.rend()) {
+            ImGui::TextWrapped("Merged into %s at t = %.3f.",
+                              body_name(project, impact->survivor).c_str(), impact->time);
+        } else {
+            ImGui::TextWrapped("This planet is not active in the current snapshot.");
+        }
+        ImGui::TextWrapped("Select an active planet to follow it. Return to Design to edit the original.");
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, {0.60f, 0.65f, 0.70f, 1.0f});
+    ImGui::TextWrapped("Simulation units. Display sizes are enlarged.");
+    ImGui::PopStyleColor();
+    if (collision_demo) {
+        ImGui::TextWrapped("Temporary Earth and Mars demo. Your DIY project is preserved.");
+    } else if (project.solar_system) {
+        ImGui::Spacing();
+        ImGui::Checkbox("Reference orbit", &state.show_reference_orbit);
+        ImGui::SetItemTooltip("Compare this planet's path with the original solar-system catalog at the same time.");
+        if (state.show_reference_orbit) {
+            ImGui::TextColored({0.95f, 0.64f, 0.24f, 1.0f}, "Catalog orbit");
+            ImGui::SameLine();
+            ImGui::TextColored({0.43f, 0.75f, 0.75f, 1.0f}, "DIY orbit");
+        }
+    }
+    const auto& events = collision_demo ? snapshot.events : state.session.observed_events();
+    ImGui::Spacing();
+    ImGui::SeparatorText("Collisions");
+    if (state.compare_modes) {
+        ImGui::TextWrapped("Exit Compare to browse collision events.");
+        return;
+    }
+    if (events.empty()) {
+        ImGui::TextWrapped("No collisions yet. Change an initial orbit in Design or try the collision demo.");
+        return;
+    }
+    ImGui::TextWrapped(collision_demo ? "Reset the demo to watch it again." :
+                                      "Select an event to pause and replay its result.");
+    std::optional<CollisionEvent> replay;
+    ImGui::BeginChild("##collision-list", {0, std::max(85.0f, ImGui::GetContentRegionAvail().y)},
+                       ImGuiChildFlags_Borders);
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+        ImGui::PushID(static_cast<int>(it - events.rbegin()));
+        const bool later = it->time > snapshot.time;
+        char label[512]{};
+        std::snprintf(label, sizeof(label), "t = %.3f%s\n%s + %s", it->time,
+                      later ? "  / later in this run" : "", body_name(project, it->survivor).c_str(),
+                      body_name(project, it->absorbed).c_str());
+        if (ImGui::Selectable(label, false, ImGuiSelectableFlags_None,
+                              {0, ImGui::GetTextLineHeight() * 2 + 8}) && !collision_demo) replay = *it;
+        ImGui::SetItemTooltip("%s absorbed %s.%s", body_name(project, it->survivor).c_str(),
+                              body_name(project, it->absorbed).c_str(),
+                              collision_demo ? "" : " Click to view the result.");
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (replay) replay_studio_collision(state, *replay);
+}
+
 void draw_inspector(StudioState& state, const RenderFrame& frame, float width) {
     ImGui::BeginChild("##inspector", ImVec2(width, 0), ImGuiChildFlags_Borders);
     ImGui::BeginDisabled(state.camera_transition.has_value());
-    ImGui::TextUnformatted("INSPECTOR");
+    const bool simulating = state.session.mode() == SessionMode::Simulate ||
+                            state.demos.active() == DemoPreset::Collision;
+    const bool switched_stage = simulating != state.inspector_was_simulating;
+    state.inspector_was_simulating = simulating;
+    ImGui::TextUnformatted(simulating ? "SIMULATION" : "PLANET DESIGN");
     ImGui::Separator();
     const auto& body = state.session.project().bodies[state.selected];
-    ImGui::Text("%s", body.id.c_str());
+    ImGui::TextColored({0.50f, 0.88f, 0.83f, 1.0f}, "%s", body.name.c_str());
     if (!state.session.project().solar_system) {
       ImGui::BeginDisabled(state.session.mode() != SessionMode::Design);
       ImGui::InputText("Name", state.name.data(), state.name.size());
@@ -691,7 +794,7 @@ void draw_inspector(StudioState& state, const RenderFrame& frame, float width) {
       }
       ImGui::EndDisabled();
     }
-    if (state.session.project().solar_system && state.design_view) {
+    if (state.session.project().solar_system && state.design_view && !simulating) {
         ImGui::Checkbox("Show baseline", &state.compare_baseline);
         ImGui::SetItemTooltip("Preview this planet's default appearance without undoing your edits.\n"
                               "Uncheck to return to your design. Unedited planets look identical.");
@@ -699,21 +802,43 @@ void draw_inspector(StudioState& state, const RenderFrame& frame, float width) {
     }
     const bool was_pixel_tab_active = state.pixel_tab_active;
     state.pixel_tab_active = false;
+    state.design_tab_active = false;
     if (ImGui::BeginTabBar("##inspector-tabs")) {
-        if (ImGui::BeginTabItem(state.session.project().solar_system ? "Design" : "Appearance")) {
+        const auto stage_tab_flags = switched_stage && !state.select_pixel_tab ? ImGuiTabItemFlags_SetSelected : 0;
+        if (ImGui::BeginTabItem(simulating ? "Simulation" :
+                               state.session.project().solar_system ? "Design" : "Appearance",
+                               nullptr, stage_tab_flags)) {
+          if (simulating) {
+            draw_simulation_inspector(state);
+          } else {
+            state.design_tab_active = true;
             ImGui::BeginDisabled(state.session.mode() != SessionMode::Design ||
                                  state.demos.active() == DemoPreset::Collision ||
                                  (state.design_view && state.compare_baseline));
-            if (state.session.project().solar_system) edit_solar_design(state);
+            if (state.session.project().solar_system && !state.design_view) {
+                ImGui::Spacing();
+                ImGui::TextWrapped("Shape %s using its original surface, atmosphere and features.", body.name.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Button, {0.12f, 0.38f, 0.39f, 1.0f});
+                if (ImGui::Button(("Design " + body.name).c_str(), {-1, 0})) {
+                    begin_studio_design_focus(state, state.selected);
+                }
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+                ImGui::TextWrapped("1. Select a planet.\n2. Adjust parameters or sculpt in close-up.\n3. Run simulation to explore orbits and collisions.");
+            } else if (state.session.project().solar_system) edit_solar_design(state);
             else edit_appearance(state);
             ImGui::EndDisabled();
+          }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Orbit / Physics")) {
+        if (ImGui::BeginTabItem(simulating ? "Initial state" : "Orbit / Physics")) {
+          if (simulating) draw_initial_motion(state.demos.project(state.session.project()).bodies[state.selected]);
+          else {
             ImGui::BeginDisabled(state.session.mode() != SessionMode::Design ||
                                  state.demos.active() == DemoPreset::Collision);
             edit_motion(state);
             ImGui::EndDisabled();
+          }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Pixel", nullptr,
@@ -736,6 +861,96 @@ void draw_inspector(StudioState& state, const RenderFrame& frame, float width) {
     ImGui::EndChild();
 }
 
+struct SceneNameTag {
+    int body_index;
+    ImVec2 min, max;
+};
+
+std::vector<SceneNameTag> draw_scene_names(StudioState& state, const StudioRenderInput& input, const RenderFrame& frame,
+                                         ImVec2 origin, ImVec2 size, bool flip_y) {
+    std::vector<SceneNameTag> tags;
+    if (!studio_scene_annotations_visible(state) || frame.panel_count != 1) return tags;
+    const auto& current = state.session.project().bodies;
+    const auto& rendered = state.frame_cache.displayed_input
+        ? state.frame_cache.displayed_input->project.bodies : input.project.bodies;
+    if (current.size() != rendered.size() ||
+        !std::equal(current.begin(), current.end(), rendered.begin(),
+                     [](const auto& a, const auto& b) { return a.id == b.id; })) {
+        // Loading/removing/reordering bodies can precede publication of the new image.
+        state.body_markers.clear();
+        state.marker_render_count = static_cast<std::uint64_t>(-1);
+        state.marker_pixels = nullptr;
+        return tags;
+    }
+    if (state.marker_render_count != state.frame_cache.render_count ||
+        state.marker_pixels != frame.body_index.data()) {
+        state.body_markers = studio_body_markers(frame, static_cast<int>(state.session.project().bodies.size()));
+        state.marker_render_count = state.frame_cache.render_count;
+        state.marker_pixels = frame.body_index.data();
+    }
+    auto markers = state.body_markers;
+    std::stable_sort(markers.begin(), markers.end(), [&](const auto& a, const auto& b) {
+        return a.body_index == state.selected && b.body_index != state.selected;
+    });
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->PushClipRect(origin, {origin.x + size.x, origin.y + size.y}, true);
+    const float sx = size.x / frame.image.width, sy = size.y / frame.image.height;
+    for (const auto& marker : markers) {
+        if (marker.body_index < 0 || marker.body_index >= static_cast<int>(current.size())) continue;
+        const bool selected = marker.body_index == state.selected;
+        const int min_y = flip_y ? frame.image.height - 1 - marker.max_y : marker.min_y;
+        const int max_y = flip_y ? frame.image.height - 1 - marker.min_y : marker.max_y;
+        const ImVec2 a{origin.x + marker.min_x * sx, origin.y + min_y * sy};
+        const ImVec2 b{origin.x + (marker.max_x + 1) * sx, origin.y + (max_y + 1) * sy};
+        const ImU32 accent = selected ? IM_COL32(106, 220, 210, 255) : IM_COL32(190, 205, 220, 225);
+        if (selected) {
+            const float corner = std::min(12.0f, std::max(5.0f, (b.x - a.x) * 0.15f));
+            for (int x_side : {-1, 1}) {
+                for (int y_side : {-1, 1}) {
+                    const ImVec2 p{x_side < 0 ? a.x - 4 : b.x + 4, y_side < 0 ? a.y - 4 : b.y + 4};
+                    draw->AddLine(p, {p.x - x_side * corner, p.y}, accent, 1.5f);
+                    draw->AddLine(p, {p.x, p.y - y_side * corner}, accent, 1.5f);
+                }
+            }
+        }
+        const auto& name = state.session.project().bodies[marker.body_index].name;
+        const char* end = name.c_str() + name.size();
+        const float max_text_width = std::max(20.0f, std::min(150.0f, size.x - 24.0f));
+        while (end > name.c_str() && ImGui::CalcTextSize(name.c_str(), end).x > max_text_width) {
+            --end;
+            while (end > name.c_str() && (static_cast<unsigned char>(*end) & 0xc0) == 0x80) --end;
+        }
+        const ImVec2 text_size = ImGui::CalcTextSize(name.c_str(), end);
+        const ImVec2 tag_size{text_size.x + 14.0f, text_size.y + 8.0f};
+        const float center = (a.x + b.x) * 0.5f;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            const float candidate_y = attempt % 2 == 0
+                ? a.y - tag_size.y - 10.0f - (attempt / 2) * (tag_size.y + 3.0f)
+                : b.y + 10.0f + (attempt / 2) * (tag_size.y + 3.0f);
+            const ImVec2 p{std::clamp(center + 8.0f, origin.x + 4.0f,
+                                      origin.x + size.x - tag_size.x - 4.0f),
+                           std::clamp(candidate_y, origin.y + 4.0f,
+                                      origin.y + size.y - tag_size.y - 4.0f)};
+            const ImVec2 q{p.x + tag_size.x, p.y + tag_size.y};
+            const bool overlap = std::any_of(tags.begin(), tags.end(), [&](const auto& tag) {
+                return p.x < tag.max.x + 3 && q.x + 3 > tag.min.x &&
+                       p.y < tag.max.y + 3 && q.y + 3 > tag.min.y;
+            });
+            if (overlap) continue;
+            const ImVec2 leader{center, p.y + tag_size.y <= a.y ? a.y : b.y};
+            draw->AddLine(leader, {p.x, p.y + tag_size.y * 0.5f},
+                          selected ? IM_COL32(106, 220, 210, 130) : IM_COL32(160, 180, 200, 75));
+            draw->AddRectFilled(p, q, IM_COL32(12, 21, 31, 225), 4.0f);
+            if (selected) draw->AddRect(p, q, accent, 4.0f);
+            draw->AddText({p.x + 7, p.y + 4}, accent, name.c_str(), end);
+            tags.push_back({marker.body_index, p, q});
+            break;
+        }
+    }
+    draw->PopClipRect();
+    return tags;
+}
+
 void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput& input,
                 const RenderFrame& frame,
                 bool flip_image_y, float width) {
@@ -746,7 +961,8 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
         reset_studio_view(state);
     }
     ImGui::SameLine();
-    if (state.session.project().solar_system && state.session.mode() == SessionMode::Design) {
+    if (state.session.project().solar_system && state.session.mode() == SessionMode::Design &&
+        state.demos.active() != DemoPreset::Collision) {
         const bool leaving = state.design_view || state.demos.active() != DemoPreset::None;
         if (ImGui::Button(leaving ? "Back to system" : "Design selected")) {
             if (leaving) {
@@ -755,8 +971,14 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
                 begin_studio_design_focus(state, state.selected);
             }
         }
-    } else if (ImGui::Button("Focus selected")) {
-        focus_studio_selected(state);
+    } else {
+        const auto& selected_id = state.session.project().bodies[state.selected].id;
+        const bool present = std::any_of(snapshot.bodies.begin(), snapshot.bodies.end(),
+                                         [&](const auto& body) { return body.id == selected_id; });
+        ImGui::BeginDisabled(!present);
+        if (ImGui::Button("Focus selected")) focus_studio_selected(state);
+        if (!present) ImGui::SetItemTooltip("Select a planet that is active in this snapshot.");
+        ImGui::EndDisabled();
     }
     ImGui::SameLine();
     if (ImGui::Checkbox("Compare", &state.compare_modes)) {
@@ -808,28 +1030,20 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
                                ImGuiSliderFlags_AlwaysClamp)) {
             seek_studio_time(state, time);
         }
-        ImGui::Checkbox("Reference orbit", &state.show_reference_orbit);
-        if (state.show_reference_orbit) {
-            ImGui::SameLine();
-            ImGui::TextColored({0.95f, 0.64f, 0.24f, 1.0f}, "Catalog");
-            ImGui::SameLine();
-            ImGui::TextColored({0.43f, 0.75f, 0.75f, 1.0f}, "DIY");
-        }
     }
     ImGui::EndDisabled();
     ImGui::Separator();
     const int image_width = frame.image.width;
     const int image_height = frame.image.height;
     const ImVec2 available = ImGui::GetContentRegionAvail();
-    const bool show_events = !state.compare_modes &&
-        (state.session.mode() == SessionMode::Simulate || state.demos.active() == DemoPreset::Collision);
-    const float image_space_height = std::max(100.0f, available.y - (show_events ? 100.0f : 0.0f));
+    const float image_space_height = std::max(100.0f, available.y - 70.0f);
     const float fit = std::min(available.x / image_width, image_space_height / image_height);
     const ImVec2 size(image_width * fit, image_height * fit);
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (available.x - size.x) * 0.5f));
     const ImVec2 top_left = ImGui::GetCursorScreenPos();
     ImGui::Image(texture, size, flip_image_y ? ImVec2(0, 1) : ImVec2(0, 0),
                  flip_image_y ? ImVec2(1, 0) : ImVec2(1, 1));
+    const auto name_tags = draw_scene_names(state, input, frame, top_left, size, flip_image_y);
     if (frame.panel_count == 2) {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const float middle = top_left.x + size.x * 0.5f;
@@ -875,7 +1089,7 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
     }
     const bool design_canvas = state.design_view && state.session.project().solar_system &&
                                state.session.mode() == SessionMode::Design;
-    const bool sculpting = design_canvas && !state.inspect_pixel && !state.compare_modes &&
+    const bool sculpting = design_canvas && state.design_tab_active && !state.inspect_pixel && !state.compare_modes &&
                            !state.pixel_tab_active &&
                            !state.camera_transition;
     const ImGuiMouseButton rotate_button = design_canvas || state.inspect_pixel || state.pixel_tab_active
@@ -934,7 +1148,14 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
             state.selected_pixel_y = y;
             state.select_pixel_tab = true;
         } else if (!state.pixel_tab_active) {
-            const int body = frame.body_index[static_cast<std::size_t>(y) * image_width + x];
+            int body = frame.body_index[static_cast<std::size_t>(y) * image_width + x];
+            for (const auto& tag : name_tags) {
+                if (mouse.x >= tag.min.x && mouse.x <= tag.max.x &&
+                    mouse.y >= tag.min.y && mouse.y <= tag.max.y) {
+                    body = tag.body_index;
+                    break;
+                }
+            }
             if (body >= 0 && !state.design_view) select_studio_scene_body(state, body);
         }
     }
@@ -951,28 +1172,11 @@ void draw_scene(StudioState& state, ImTextureID texture, const StudioRenderInput
         state.selected_pixel_x = panel * panel_width + std::clamp(x, 0, panel_width - 1);
         state.selected_pixel_y = std::clamp(y, 0, image_height - 1);
     }
-    if (show_events) {
-        ImGui::BeginDisabled(state.camera_transition.has_value());
-        ImGui::SeparatorText("Events");
-        const auto& events = orbit_lab ? state.session.observed_events() : snapshot.events;
-        if (events.empty()) ImGui::TextDisabled("No collisions");
-        std::optional<double> pending_seek;
-        for (auto it = events.rbegin(); it != events.rend(); ++it) {
-            if (orbit_lab) {
-                char label[192]{};
-                std::snprintf(label, sizeof(label), "%.3f   %s + %s", it->time,
-                              it->survivor.c_str(), it->absorbed.c_str());
-                if (ImGui::Selectable(label)) {
-                    pending_seek = std::min(100000.0, it->time + 0.05);
-                }
-            } else {
-                ImGui::Text("%.3f   %s + %s", it->time, it->survivor.c_str(),
-                            it->absorbed.c_str());
-            }
-        }
-        if (pending_seek) seek_studio_time(state, *pending_seek);
-        ImGui::EndDisabled();
-    }
+    const auto workflow = studio_workflow(state);
+    ImGui::TextColored({0.43f, 0.83f, 0.79f, 1.0f}, "%s", workflow.title.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, {0.65f, 0.72f, 0.80f, 1.0f});
+    ImGui::TextWrapped("%s", workflow.hint.c_str());
+    ImGui::PopStyleColor();
     ImGui::EndChild();
 }
 
@@ -1344,7 +1548,10 @@ void draw_studio(StudioState& state, ImTextureID texture, const StudioRenderInpu
     } else if (state.session.mode() == SessionMode::Design) {
         ImGui::TextDisabled("DESIGN");
         ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, {0.12f, 0.38f, 0.39f, 1.0f});
         if (ImGui::Button("Run simulation")) begin_studio_simulation(state);
+        ImGui::SetItemTooltip("Fly back to the full system and simulate your current design.\nReturn to Design to keep editing.");
+        ImGui::PopStyleColor();
     } else {
         if (ImGui::Button("Design")) return_studio_design(state);
         ImGui::SameLine();

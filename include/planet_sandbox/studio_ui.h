@@ -17,6 +17,19 @@ namespace planet_sandbox {
 
 enum class StudioCameraDestination { Design, Overview, Simulation, DesignOverview, Camera };
 
+enum class StudioWorkflowStage { Overview, Design, Simulation, Collision, Transition };
+
+struct StudioWorkflow {
+    StudioWorkflowStage stage = StudioWorkflowStage::Overview;
+    std::string title;
+    std::string hint;
+};
+
+struct StudioBodyMarker {
+    int body_index = -1;
+    int min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+};
+
 struct StudioCameraTransition {
     RenderCamera from;
     RenderCamera to;
@@ -98,8 +111,13 @@ struct StudioState {
     int pixel_region_size = 9;
     bool select_pixel_tab = false;
     bool pixel_tab_active = false;
+    bool design_tab_active = true;
     StudioRenderMeasurement measurement;
     StudioFrameCache frame_cache;
+    std::vector<StudioBodyMarker> body_markers;
+    std::uint64_t marker_render_count = static_cast<std::uint64_t>(-1);
+    const int* marker_pixels = nullptr;
+    bool inspector_was_simulating = false;
     // Explicit scene changes invalidate old jobs without interrupting sculpt revisions.
     std::uint64_t scene_generation = 0;
     bool preview_interacting = false;
@@ -133,6 +151,10 @@ struct StudioPixelRegion {
 StudioPixelRegion studio_pixel_region(const RenderFrame& frame, int pixel_x, int pixel_y,
                                       int cells);
 
+StudioWorkflow studio_workflow(const StudioState& state);
+std::vector<StudioBodyMarker> studio_body_markers(const RenderFrame& frame, int body_count);
+bool studio_scene_annotations_visible(const StudioState& state);
+
 StudioRenderInput make_studio_render_input(const StudioState& state);
 RenderFrame render_studio_frame(const StudioState& state, const StudioRenderInput& input);
 // Reuses the displayed frame for timing, then caches it once the measurement is complete.
@@ -151,6 +173,7 @@ void focus_studio_selected(StudioState& state);
 void reset_studio_view(StudioState& state);
 double studio_timeline_limit(const StudioState& state);
 void seek_studio_time(StudioState& state, double time);
+bool replay_studio_collision(StudioState& state, const CollisionEvent& event);
 bool apply_studio_edit(StudioState& state, Project project, const std::string& label,
                        const std::string& body_id = {}, const std::string& group = {});
 Project open_studio_project(const std::filesystem::path& path, bool create_if_missing);

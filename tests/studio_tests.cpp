@@ -19,11 +19,79 @@
 
 using namespace planet_sandbox;
 
+static void test_workflow_guidance_follows_the_active_tool() {
+    StudioState state(make_solar_system_project(), "workflow.json");
+    state.selected = 3;
+    auto workflow = studio_workflow(state);
+    assert(workflow.stage == StudioWorkflowStage::Overview);
+    assert(workflow.title.find("Earth") != std::string::npos);
+    assert(workflow.hint.find("select") != std::string::npos);
+    begin_studio_design_focus(state, 3);
+    assert(studio_workflow(state).stage == StudioWorkflowStage::Transition);
+    while (state.camera_transition) advance_studio(state, 0.1);
+    workflow = studio_workflow(state);
+    assert(workflow.stage == StudioWorkflowStage::Design);
+    assert(workflow.hint.find("brush") != std::string::npos);
+    state.compare_baseline = true;
+    assert(studio_workflow(state).hint.find("baseline") != std::string::npos);
+    state.inspect_pixel = state.pixel_tab_active = true;
+    assert(studio_workflow(state).hint.find("pixel") != std::string::npos);
+    state.inspect_pixel = state.pixel_tab_active = false;
+    begin_studio_simulation(state);
+    while (state.camera_transition) advance_studio(state, 0.1);
+    assert(studio_workflow(state).stage == StudioWorkflowStage::Simulation);
+    assert(studio_workflow(state).hint.find("collision") != std::string::npos);
+}
+
+static void test_markers_use_visible_surface_pixels_not_orbit_trails() {
+    RenderFrame frame;
+    frame.image.width = 8; frame.image.height = 6;
+    frame.body_index.assign(48, -1);
+    frame.surface_uv.assign(48, {-1.0, -1.0});
+    for (int y = 2; y <= 4; ++y) {
+        for (int x = 3; x <= 5; ++x) {
+            frame.body_index[y * 8 + x] = 3;
+            frame.surface_uv[y * 8 + x] = {0.25, 0.5};
+        }
+    }
+    frame.body_index[0] = 3; // Same body's trajectory must not expand its label bounds.
+    frame.body_index[1] = 4; // A trail-only/merged body must not get a planet label.
+    frame.body_index[47] = 200; // Ignore identities outside the current catalog.
+    frame.surface_uv[47] = {0.5, 0.5};
+    const auto markers = studio_body_markers(frame, 9);
+    assert(markers.size() == 1);
+    assert(markers[0].body_index == 3);
+    assert(markers[0].min_x == 3 && markers[0].max_x == 5);
+    assert(markers[0].min_y == 2 && markers[0].max_y == 4);
+    frame.surface_uv.clear();
+    assert(studio_body_markers(frame, 9).empty());
+}
+
+static void test_collision_replay_pauses_selects_survivor_and_keeps_design() {
+    auto project = make_solar_system_project();
+    project.bodies[4].position = project.bodies[3].position;
+    StudioState state(project, "collision-workflow.json");
+    const auto original = project_document(state.session.project());
+    state.session.begin_simulation();
+    assert(!state.session.observed_events().empty());
+    const auto event = state.session.observed_events().front();
+    state.selected = 4;
+    assert(replay_studio_collision(state, event));
+    assert(!state.session.playing());
+    assert(state.session.project().bodies[state.selected].id == event.survivor);
+    assert(state.session.snapshot().time >= event.time);
+    assert(project_document(state.session.project()) == original);
+    state.session.return_to_design();
+    assert(!replay_studio_collision(state, event));
+}
+
 // Exercise the same render/UI order as the desktop with actual mouse events.
 struct StudioUiTest {
     StudioState state{make_solar_system_project(), "ui-regression.json"};
     double now = 0.0;
     bool hold_frame = false;
+    bool capture_text = false;
+    std::string drawn_text;
 
     StudioUiTest() {
         ImGui::CreateContext();
@@ -48,8 +116,17 @@ struct StudioUiTest {
         const auto& frame = hold_frame ? *state.frame_cache.frame
                                       : update_studio_frame(state, input, now);
         ImGui::NewFrame();
+        if (capture_text) ImGui::LogToBuffer();
         draw_studio(state, 1, input, frame, false);
+        if (capture_text) {
+            drawn_text = GImGui->LogBuffer.c_str();
+            ImGui::LogFinish();
+        }
         ImGui::Render();
+    }
+    std::string text() {
+        capture_text = true; draw(); capture_text = false;
+        return drawn_text;
     }
     void click(float x, float y) {
         auto& io = ImGui::GetIO();
@@ -78,6 +155,128 @@ struct StudioUiTest {
         return text.str();
     }
 };
+
+static void test_inspector_switches_from_pixel_to_simulation_and_back() {
+    StudioUiTest ui;
+    const auto design = ui.project_text();
+    ui.click_tab(2);
+    assert(ui.state.pixel_tab_active);
+    begin_studio_simulation(ui.state);
+    while (ui.state.camera_transition) ui.draw();
+    ui.state.session.set_playing(false);
+    ui.draw(); ui.draw();
+    assert(!ui.state.pixel_tab_active);
+    auto text = ui.text();
+    assert(text.find("Live orbit") != std::string::npos);
+    assert(text.find("Collisions") != std::string::npos);
+    assert(text.find("Relative terrain relief") == std::string::npos);
+    ui.click_tab(2);
+    return_studio_design(ui.state);
+    while (ui.state.camera_transition) ui.draw();
+    ui.draw(); ui.draw();
+    assert(!ui.state.pixel_tab_active);
+    assert(ui.project_text() == design);
+    assert(ui.text().find("Design Earth") != std::string::npos);
+}
+
+static void test_analysis_hides_scene_annotations_and_guides_the_tool() {
+    StudioUiTest ui;
+    assert(studio_scene_annotations_visible(ui.state));
+    ui.click_tab(2);
+    assert(!studio_scene_annotations_visible(ui.state));
+    ui.state.inspect_pixel = false;
+    assert(!studio_scene_annotations_visible(ui.state));
+    ui.click_tab(0);
+    assert(studio_scene_annotations_visible(ui.state));
+    ui.state.compare_modes = true;
+    assert(!studio_scene_annotations_visible(ui.state));
+}
+
+static void test_orbit_tab_does_not_paint_the_closeup() {
+    StudioUiTest ui;
+    ui.click_tab(1);
+    const auto before = ui.project_text();
+    ui.click(600, 347);
+    assert(ui.project_text() == before);
+    assert(studio_workflow(ui.state).hint.find("initial") != std::string::npos);
+    ui.click_tab(0);
+    ui.click(600, 347);
+    assert(ui.project_text() != before);
+}
+
+static void test_collision_bookmark_click_after_rewind() {
+    StudioUiTest ui;
+    exit_studio_preset(ui.state);
+    auto project = ui.state.session.project();
+    project.bodies[3].position = {4.0, 0.0};
+    project.bodies[3].velocity = {0.0, 0.0};
+    project.bodies[4].position = {4.5, 0.0};
+    project.bodies[4].velocity = {-1.0, 0.0};
+    ui.state.session.replace_project(project);
+    ui.state.session.begin_simulation();
+    seek_studio_time(ui.state, 0.8);
+    assert(ui.state.session.observed_events().size() == 1);
+    const auto event = ui.state.session.observed_events().front();
+    seek_studio_time(ui.state, 0.0);
+    ui.draw(); ui.draw();
+    const auto text = ui.text();
+    assert(text.find("Earth + Mars") != std::string::npos);
+    assert(text.find("later in this run") != std::string::npos);
+    ImGuiWindow* list = nullptr;
+    for (auto* window : GImGui->Windows) {
+        if (std::strstr(window->Name, "/##collision-list_")) list = window;
+    }
+    assert(list);
+    ui.click(list->WorkRect.Min.x + 45, list->WorkRect.Min.y + 14);
+    assert(!ui.state.session.playing());
+    assert(ui.state.session.snapshot().time >= event.time);
+    assert(ui.state.session.project().bodies[ui.state.selected].id == "earth");
+    assert(ui.state.session.observed_events().size() == 1);
+    select_studio_scene_body(ui.state, 4);
+    assert(ui.text().find("Merged into Earth") != std::string::npos);
+}
+
+static void test_collision_demo_inspector_uses_its_temporary_initial_conditions() {
+    StudioUiTest ui;
+    activate_studio_preset(ui.state, DemoPreset::Collision);
+    ui.state.demos.set_playing(false);
+    ui.draw(); ui.draw();
+    assert(ui.text().find("Temporary Earth and Mars demo") != std::string::npos);
+    ui.click_tab(1);
+    assert(ui.text().find("Position: 4.000, 0.000") != std::string::npos);
+    assert(ui.state.session.project().bodies[3].position.x != 4.0);
+}
+
+static void test_old_frame_markers_do_not_relabel_a_changed_catalog() {
+    StudioUiTest ui;
+    exit_studio_preset(ui.state);
+    ui.state.design_view = false;
+    ui.state.selected = 0;
+    ui.state.render.camera = {};
+    ui.state.render.camera.zoom = 0.55;
+    ui.draw(); ui.draw();
+    assert(ui.state.body_markers.size() > 2);
+    const auto original = ui.state.session.project();
+    // Keep displaying the previous project's image while loading/removing bodies.
+    ui.state.frame_cache.displayed_input = make_studio_render_input(ui.state);
+    ui.hold_frame = true;
+    auto smaller = original;
+    smaller.solar_system = false;
+    smaller.bodies.resize(2);
+    ui.state.session.replace_project(smaller);
+    ui.draw();
+    assert(ui.state.body_markers.empty());
+    auto reordered = original;
+    reordered.solar_system = false;
+    for (auto& body : reordered.bodies) body.radius = 0.5;
+    std::swap(reordered.bodies[3], reordered.bodies[4]);
+    ui.state.session.replace_project(reordered);
+    ui.draw();
+    assert(ui.state.body_markers.empty());
+    ui.hold_frame = false;
+    ui.draw();
+    assert(!ui.state.body_markers.empty());
+}
 
 static void test_stale_async_view_blocks_sculpt_and_pixel_selection() {
     StudioUiTest ui;
@@ -817,6 +1016,15 @@ static void test_auto_measurement_reuses_frames_and_invalidates() {
 }
 
 int main() {
+    test_old_frame_markers_do_not_relabel_a_changed_catalog();
+    test_collision_demo_inspector_uses_its_temporary_initial_conditions();
+    test_orbit_tab_does_not_paint_the_closeup();
+    test_collision_bookmark_click_after_rewind();
+    test_collision_replay_pauses_selects_survivor_and_keeps_design();
+    test_inspector_switches_from_pixel_to_simulation_and_back();
+    test_analysis_hides_scene_annotations_and_guides_the_tool();
+    test_workflow_guidance_follows_the_active_tool();
+    test_markers_use_visible_surface_pixels_not_orbit_trails();
     test_history_shortcuts_respect_text_input();
     test_parameter_drag_is_one_undo_step_and_redo_restores_it();
     test_loading_same_catalog_rejects_old_async_view();

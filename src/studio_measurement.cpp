@@ -130,6 +130,7 @@ const RenderFrame& update_studio_frame(StudioState& state, const StudioRenderInp
             ? render_comparison_scene(input.project, input.snapshot, input.config,
                 state.compare_left, state.compare_right, result.completed_runs % 2 != 0)
             : render_scene(input.project, input.snapshot, input.config);
+        cache.displayed_input = input;
         cache.input_key = key;
         cache.trace_x = input.config.trace_x;
         cache.trace_y = input.config.trace_y;

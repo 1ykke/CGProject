@@ -115,7 +115,7 @@ if(PLANET_BUILD_DESKTOP)
     target_link_libraries(imgui PUBLIC glfw)
 
     add_library(planet_studio_support STATIC
-        src/studio_ui.cpp src/studio_measurement.cpp src/studio_render_worker.cpp
+        src/studio_ui.cpp src/studio_workflow.cpp src/studio_measurement.cpp src/studio_render_worker.cpp
         src/project_history.cpp src/project_recovery.cpp src/studio_document.cpp)
     target_link_libraries(planet_studio_support PUBLIC planet_core imgui Threads::Threads)
 
