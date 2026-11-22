@@ -126,7 +126,7 @@ TimedFrame render_timed(const AABenchmarkScene& scene, SamplingMode mode, const 
         result.frame = render_scene(scene.project, scene.snapshot, config);
         times.push_back(result.frame.render_ms);
         samples << scene.name << ',' << name << ',' << run + 1 << ','
-                << result.frame.render_ms << '\n';
+                << result.frame.render_ms << ',' << config.width << ',' << config.height << '\n';
     }
     std::sort(times.begin(), times.end());
     result.milliseconds = (times[(runs - 1) / 2] + times[runs / 2]) / 2.0;
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
 
         std::ofstream samples(directory / "timings.csv");
         if (!samples) throw std::runtime_error("Could not write timings.csv");
-        samples << "scene,mode,run,render_ms\n" << std::setprecision(10);
+        samples << "scene,mode,run,render_ms,width,height\n" << std::setprecision(10);
 
         for (const AABenchmarkScene& scene : scenes) {
             const TimedFrame reference = render_timed(scene, SamplingMode::SSAA16, "ssaa16", warmup, runs, samples);
