@@ -40,6 +40,9 @@ PPM 可用系统图片工具转换为 PNG。`--sampling` 接受 `single`、`ssaa
 ./build-headless/planet_aa_benchmark --config my-solar-system.json --output-dir build-headless/my-aa-run-001 --width 256 --height 192
 ```
 
+正式实验使用 Release。CLI 默认每个场景和方法预热 3 次、测量 11 次，可通过 `--warmup` 和 `--runs` 调整。`metrics.csv` 的 `render_ms` 为 CPU 渲染中位数，`render_p95_ms` 使用最近秩法，`timings.csv` 保存每次正式采样。已有 PNG、参考图、边缘掩码和项目 JSON 一并保留。计时采用渲染器内部时钟，范围与 Pixel 页一致。跨机器对照时，随结果记录提交号、系统、CPU、编译器及 Release 配置。
+
+
 实验固定地球轮廓、土星环边缘和细轨道线，逐场景对同一快照与相机生成 `single`、`ssaa4`、`msaa4` 和离线 `ssaa16` PNG。每个场景另有 `_edges.png`，白色部分是参考图逐样本几何边缘及其一像素邻域；同一星球的云层与地表按同一几何归属计。`metrics.csv` 的 `edge_mae_linear` 与 `full_mae_linear` 是显示图像解码回 gamma 2.2 线性空间后的平均 RGB 绝对误差；`shade_evaluations` 只统计片元着色，细轨道线为零。每种模式先进行一次不计时预热；`render_ms` 仅计随后一次 CPU 渲染，不含 PNG 写入，适合观察本机趋势，不作为严格性能基准。输出中的 `project.json` 保存本次 DIY 参数。输出路径必须是尚不存在的新目录，全部文件写完后才发布，以免失败重跑混入旧结果。16× 仅用于离线近似参考，不进入桌面实时采样菜单。PNG 使用随项目附带的 `stb_image_write`（Public Domain / MIT）。
 
 ### 桌面编辑器

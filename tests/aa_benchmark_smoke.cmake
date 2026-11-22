@@ -1,7 +1,7 @@
 string(RANDOM LENGTH 10 ALPHABET 0123456789abcdef suffix)
 string(ASCII 230 181 139 232 175 149 unicode_name)
 set(output_dir "${TEST_ROOT}/aa-${unicode_name}-${suffix}")
-execute_process(COMMAND "${CLI}" --output-dir "${output_dir}" --width 64 --height 48
+execute_process(COMMAND "${CLI}" --output-dir "${output_dir}" --width 64 --height 48 --warmup 0 --runs 2
                 RESULT_VARIABLE first_result OUTPUT_VARIABLE first_output ERROR_VARIABLE first_error)
 if(NOT first_result EQUAL 0)
     message(FATAL_ERROR "Benchmark export failed: ${first_output} ${first_error}")
@@ -16,8 +16,22 @@ list(LENGTH csv_lines csv_count)
 if(NOT csv_count EQUAL 13)
     message(FATAL_ERROR "Expected CSV header and 12 results, found ${csv_count}")
 endif()
+file(STRINGS "${output_dir}/timings.csv" timing_lines)
+list(LENGTH timing_lines timing_count)
+if(NOT timing_count EQUAL 25)
+    message(FATAL_ERROR "Expected timing header and 24 samples, found ${timing_count}")
+endif()
+list(GET csv_lines 1 first_metrics)
+if(NOT first_metrics MATCHES ",0,2$")
+    message(FATAL_ERROR "Expected summary to record zero warmups and two runs")
+endif()
+execute_process(COMMAND "${CLI}" --output-dir "${TEST_ROOT}/aa-invalid-${suffix}"
+                        --runs 0 RESULT_VARIABLE bad_runs_result)
+if(bad_runs_result EQUAL 0)
+    message(FATAL_ERROR "Zero measured runs were accepted")
+endif()
 file(SHA256 "${output_dir}/earth_ssaa16.png" before_hash)
-execute_process(COMMAND "${CLI}" --output-dir "${output_dir}" --width 64 --height 48
+execute_process(COMMAND "${CLI}" --output-dir "${output_dir}" --width 64 --height 48 --warmup 0 --runs 2
                 RESULT_VARIABLE existing_result)
 if(existing_result EQUAL 0)
     message(FATAL_ERROR "Existing benchmark output was overwritten")

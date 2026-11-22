@@ -1,7 +1,9 @@
 #include "planet_sandbox/aa_benchmark.h"
 #include "planet_sandbox/solar_system.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -25,6 +27,7 @@ namespace {
 struct TimedFrame {
     RenderFrame frame;
     double milliseconds = 0.0;
+    double p95_ms = 0.0;
 };
 
 std::vector<std::string> command_line_arguments(int argc, char** argv) {
@@ -108,22 +111,35 @@ int parse_dimension(const std::string& value) {
     return dimension;
 }
 
-TimedFrame render_timed(const AABenchmarkScene& scene, SamplingMode mode) {
+TimedFrame render_timed(const AABenchmarkScene& scene, SamplingMode mode, const char* name,
+                        int warmup, int runs, std::ostream& samples) {
     RenderConfig config = scene.config;
     config.sampling = mode;
-    render_scene(scene.project, scene.snapshot, config);
-    const auto start = std::chrono::steady_clock::now();
-    RenderFrame frame = render_scene(scene.project, scene.snapshot, config);
-    const auto end = std::chrono::steady_clock::now();
-    return {std::move(frame), std::chrono::duration<double, std::milli>(end - start).count()};
+    for (int run = 0; run < warmup; ++run) {
+        render_scene(scene.project, scene.snapshot, config);
+    }
+
+    TimedFrame result;
+    std::vector<double> times;
+    times.reserve(runs);
+    for (int run = 0; run < runs; ++run) {
+        result.frame = render_scene(scene.project, scene.snapshot, config);
+        times.push_back(result.frame.render_ms);
+        samples << scene.name << ',' << name << ',' << run + 1 << ','
+                << result.frame.render_ms << '\n';
+    }
+    std::sort(times.begin(), times.end());
+    result.milliseconds = (times[(runs - 1) / 2] + times[runs / 2]) / 2.0;
+    result.p95_ms = times[static_cast<std::size_t>(std::ceil(0.95 * runs)) - 1];
+    return result;
 }
 
 void write_row(std::ostream& output, const AABenchmarkScene& scene, const char* mode,
-               const TimedFrame& timed, const AAError& error) {
+               const TimedFrame& timed, const AAError& error, int warmup, int runs) {
     output << scene.name << ',' << mode << ',' << scene.config.width << ',' << scene.config.height
            << ',' << error.edge_pixels << ',' << error.edge_mae_linear << ','
            << error.full_mae_linear << ',' << timed.frame.shade_evaluations << ','
-           << timed.milliseconds << '\n';
+           << timed.milliseconds << ',' << timed.p95_ms << ',' << warmup << ',' << runs << '\n';
     if (!output) throw std::runtime_error("Could not write benchmark CSV");
 }
 
@@ -134,11 +150,12 @@ int main(int argc, char** argv) {
         const std::vector<std::string> arguments = command_line_arguments(argc, argv);
         std::string output_dir, config_path;
         int width = 256, height = 192;
+        int warmup = 3, runs = 11;
         for (std::size_t i = 1; i < arguments.size(); ++i) {
             const std::string& option = arguments[i];
             if (option == "--help") {
                 std::cout << "Usage: planet_aa_benchmark --output-dir DIR "
-                             "[--config solar-system.json] [--width N] [--height N]\n";
+                             "[--config solar-system.json] [--width N] [--height N] [--warmup N] [--runs N]\n";
                 return 0;
             }
             if (i + 1 >= arguments.size()) throw std::invalid_argument("Missing value for " + option);
@@ -147,9 +164,14 @@ int main(int argc, char** argv) {
             else if (option == "--config") config_path = value;
             else if (option == "--width") width = parse_dimension(value);
             else if (option == "--height") height = parse_dimension(value);
+            else if (option == "--warmup") warmup = parse_dimension(value);
+            else if (option == "--runs") runs = parse_dimension(value);
             else throw std::invalid_argument("Unknown option: " + option);
         }
         if (output_dir.empty()) throw std::invalid_argument("--output-dir is required");
+        if (warmup < 0 || warmup > 1000 || runs < 1 || runs > 1000) {
+            throw std::invalid_argument("--warmup must be 0-1000 and --runs must be 1-1000");
+        }
         Project project = make_solar_system_project();
         if (!config_path.empty()) {
             std::ifstream input{std::filesystem::u8path(config_path)};
@@ -170,10 +192,14 @@ int main(int argc, char** argv) {
         std::ofstream csv(directory / "metrics.csv");
         if (!csv) throw std::runtime_error("Could not write metrics.csv");
         csv << "scene,mode,width,height,edge_pixels,edge_mae_linear,full_mae_linear,"
-               "shade_evaluations,render_ms\n" << std::setprecision(10);
+               "shade_evaluations,render_ms,render_p95_ms,warmup_runs,sample_runs\n" << std::setprecision(10);
+
+        std::ofstream samples(directory / "timings.csv");
+        if (!samples) throw std::runtime_error("Could not write timings.csv");
+        samples << "scene,mode,run,render_ms\n" << std::setprecision(10);
 
         for (const AABenchmarkScene& scene : scenes) {
-            const TimedFrame reference = render_timed(scene, SamplingMode::SSAA16);
+            const TimedFrame reference = render_timed(scene, SamplingMode::SSAA16, "ssaa16", warmup, runs, samples);
             const auto mask = make_aa_edge_mask(reference.frame);
             write_png((directory / (scene.name + "_ssaa16.png")).u8string(), reference.frame.image);
             Image mask_image{width, height, std::vector<std::uint8_t>(mask.size() * 3, 0)};
@@ -185,19 +211,21 @@ int main(int argc, char** argv) {
             }
             write_png((directory / (scene.name + "_edges.png")).u8string(), mask_image);
             write_row(csv, scene, "ssaa16", reference,
-                      measure_aa_error(reference.frame.image, reference.frame.image, mask));
+                      measure_aa_error(reference.frame.image, reference.frame.image, mask), warmup, runs);
             for (const auto& option : std::array<std::pair<SamplingMode, const char*>, 3>{
                      {{SamplingMode::Single, "single"}, {SamplingMode::SSAA4, "ssaa4"},
                       {SamplingMode::MSAA4, "msaa4"}}}) {
-                const TimedFrame candidate = render_timed(scene, option.first);
+                const TimedFrame candidate = render_timed(scene, option.first, option.second, warmup, runs, samples);
                 write_png((directory / (scene.name + "_" + option.second + ".png")).u8string(),
                           candidate.frame.image);
                 write_row(csv, scene, option.second, candidate,
-                          measure_aa_error(candidate.frame.image, reference.frame.image, mask));
+                          measure_aa_error(candidate.frame.image, reference.frame.image, mask), warmup, runs);
             }
         }
         csv.close();
         if (!csv) throw std::runtime_error("Could not finish metrics.csv");
+        samples.close();
+        if (!samples) throw std::runtime_error("Could not finish timings.csv");
         output.publish();
         std::cout << "Wrote benchmark to " << output_dir << '\n';
         return 0;
